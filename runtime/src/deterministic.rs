@@ -219,10 +219,58 @@ impl Auditor {
 /// A dynamic RNG that can safely be sent between threads.
 pub type BoxDynRng = Box<dyn CryptoRng + Send + 'static>;
 
+/// A task that is ready to be polled by the deterministic executor.
+///
+/// The runtime token remains private so policies can only reorder the supplied batch. Callers
+/// identify work through the supervisor name attached when the task was spawned.
+pub struct RunnableTask {
+    token: u128,
+    name: Name,
+    generation: u64,
+    activation: u64,
+    root: bool,
+}
+
+impl RunnableTask {
+    /// Return the task's supervisor name and attributes.
+    pub const fn name(&self) -> &Name {
+        &self.name
+    }
+
+    /// Return this task's generation among tasks spawned with the same supervisor name.
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Return this task's occurrence when it was enqueued more than once in the ready batch.
+    pub const fn activation(&self) -> u64 {
+        self.activation
+    }
+
+    /// Return whether this is the runner's root future.
+    pub const fn is_root(&self) -> bool {
+        self.root
+    }
+}
+
+/// Orders each batch of tasks ready for polling by the deterministic executor.
+///
+/// Every task in the batch is polled exactly once. The policy may only change their order.
+pub trait SchedulingPolicy: Send + 'static {
+    /// Reorder a batch of runnable tasks in place.
+    fn order(&mut self, virtual_time: SystemTime, ready: &mut [RunnableTask]);
+}
+
+/// A dynamic deterministic scheduling policy.
+pub type BoxDynSchedulingPolicy = Box<dyn SchedulingPolicy>;
+
 /// Configuration for the `deterministic` runtime.
 pub struct Config {
     /// Random number generator.
     rng: BoxDynRng,
+
+    /// Optional task-ordering policy. The seeded random shuffle is used when absent.
+    scheduling_policy: Option<BoxDynSchedulingPolicy>,
 
     /// The cycle duration determines how much time is advanced after each iteration of the event
     /// loop. This is useful to prevent starvation if some task never yields.
@@ -270,6 +318,7 @@ impl Config {
 
         Self {
             rng: Box::new(StdRng::seed_from_u64(42)),
+            scheduling_policy: None,
             cycle: Duration::from_millis(1),
             start_time: UNIX_EPOCH,
             timeout: None,
@@ -294,6 +343,12 @@ impl Config {
     /// RNG object, any behavior is possible.
     pub fn with_rng(mut self, rng: impl Into<BoxDynRng>) -> Self {
         self.rng = rng.into();
+        self
+    }
+
+    /// Order runnable task batches with a caller-provided policy.
+    pub fn with_scheduling_policy(mut self, policy: impl SchedulingPolicy) -> Self {
+        self.scheduling_policy = Some(Box::new(policy));
         self
     }
 
@@ -395,6 +450,7 @@ pub struct Executor {
     metrics: Arc<Metrics>,
     auditor: Arc<Auditor>,
     rng: Arc<Mutex<BoxDynRng>>,
+    scheduling_policy: Option<Arc<Mutex<BoxDynSchedulingPolicy>>>,
     time: Mutex<SystemTime>,
     tasks: Arc<Tasks>,
     sleeping: Mutex<BinaryHeap<Alarm>>,
@@ -503,6 +559,7 @@ pub struct Checkpoint {
     deadline: Option<SystemTime>,
     auditor: Arc<Auditor>,
     rng: Arc<Mutex<BoxDynRng>>,
+    scheduling_policy: Option<Arc<Mutex<BoxDynSchedulingPolicy>>>,
     time: Mutex<SystemTime>,
     storage: MemStorageSnapshot,
     storage_fault_cfg: FaultConfig,
@@ -603,10 +660,34 @@ impl Runner {
                 // Drain all ready tasks
                 let mut queue = executor.tasks.drain();
 
-                // Shuffle tasks (if more than one)
+                // Order tasks (if more than one)
                 if queue.len() > 1 {
-                    let mut rng = executor.rng.lock();
-                    queue.shuffle(&mut *rng);
+                    if let Some(policy) = &executor.scheduling_policy {
+                        let mut activations = BTreeMap::<u128, u64>::new();
+                        let mut ready = queue
+                            .into_iter()
+                            .filter_map(|token| {
+                                let task = executor.tasks.get(token)?;
+                                let activation = activations.entry(token).or_default();
+                                let current_activation = *activation;
+                                *activation = activation
+                                    .checked_add(1)
+                                    .expect("ready activation overflow");
+                                Some(RunnableTask {
+                                    token,
+                                    name: task.name.clone(),
+                                    generation: task.generation,
+                                    activation: current_activation,
+                                    root: matches!(&task.mode, Mode::Root),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        policy.lock().order(current, &mut ready);
+                        queue = ready.into_iter().map(|task| task.token).collect();
+                    } else {
+                        let mut rng = executor.rng.lock();
+                        queue.shuffle(&mut *rng);
+                    }
                 }
 
                 // Run all snapshotted tasks
@@ -744,6 +825,7 @@ impl Runner {
             deadline: executor.deadline,
             auditor: executor.auditor,
             rng: executor.rng,
+            scheduling_policy: executor.scheduling_policy,
             time: executor.time,
             storage,
             storage_fault_cfg,
@@ -786,6 +868,8 @@ enum Mode {
 struct Task {
     id: u128,
     label: Label,
+    name: Name,
+    generation: u64,
 
     mode: Mode,
 }
@@ -813,6 +897,8 @@ impl ArcWake for TaskWaker {
 struct Tasks {
     /// The next task id.
     counter: Mutex<u128>,
+    /// Next generation for each semantic supervisor name.
+    generations: Mutex<BTreeMap<Vec<u8>, u64>>,
     /// Tasks ready to be polled.
     ready: Mutex<Vec<u128>>,
     /// All running tasks.
@@ -824,6 +910,7 @@ impl Tasks {
     const fn new() -> Self {
         Self {
             counter: Mutex::new(0),
+            generations: Mutex::new(BTreeMap::new()),
             ready: Mutex::new(Vec::new()),
             running: Mutex::new(BTreeMap::new()),
         }
@@ -837,6 +924,23 @@ impl Tasks {
         old
     }
 
+    fn next_generation(&self, name: &Name) -> u64 {
+        let mut key = Vec::new();
+        key.extend_from_slice(&(name.label.len() as u64).to_be_bytes());
+        key.extend_from_slice(name.label.as_bytes());
+        for (attribute, value) in &name.attributes {
+            key.extend_from_slice(&(attribute.len() as u64).to_be_bytes());
+            key.extend_from_slice(attribute.as_bytes());
+            key.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            key.extend_from_slice(value.as_bytes());
+        }
+        let mut generations = self.generations.lock();
+        let generation = generations.entry(key).or_default();
+        let current = *generation;
+        *generation = generation.checked_add(1).expect("task generation overflow");
+        current
+    }
+
     /// Register the root task.
     ///
     /// If the root task has already been registered, this function will panic.
@@ -845,6 +949,8 @@ impl Tasks {
         let task = Arc::new(Task {
             id,
             label: Label::root(),
+            name: Name::default(),
+            generation: 0,
             mode: Mode::Root,
         });
         arc_self.register(id, task);
@@ -854,12 +960,16 @@ impl Tasks {
     fn register_work(
         arc_self: &Arc<Self>,
         label: Label,
+        name: Name,
         future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     ) {
         let id = arc_self.increment();
+        let generation = arc_self.next_generation(&name);
         let task = Arc::new(Task {
             id,
             label,
+            name,
+            generation,
             mode: Mode::Work(Mutex::new(Some(future))),
         });
         arc_self.register(id, task);
@@ -970,6 +1080,9 @@ impl Context {
 
         // Create shared RNG (used by both executor and storage)
         let rng = Arc::new(Mutex::new(cfg.rng));
+        let scheduling_policy = cfg
+            .scheduling_policy
+            .map(|policy| Arc::new(Mutex::new(policy)));
 
         // Initialize buffer pools
         let network_buffer_pool = BufferPool::new(
@@ -1003,6 +1116,7 @@ impl Context {
             metrics,
             auditor,
             rng,
+            scheduling_policy,
             time: Mutex::new(start_time),
             tasks: Arc::new(Tasks::new()),
             sleeping: Mutex::new(BinaryHeap::new()),
@@ -1077,6 +1191,7 @@ impl Context {
             deadline: checkpoint.deadline,
             auditor: checkpoint.auditor,
             rng: checkpoint.rng,
+            scheduling_policy: checkpoint.scheduling_policy,
             time: checkpoint.time,
             dns: checkpoint.dns,
 
@@ -1177,7 +1292,8 @@ impl crate::Spawner for Context {
         Fut: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        // Get metrics
+        // Get metrics and retain the semantic identity before the context is moved into the task.
+        let name = crate::Supervisor::name(&self);
         let (label, metric) = spawn_metrics!(self);
 
         // Track supervision before resetting configuration
@@ -1199,7 +1315,7 @@ impl crate::Spawner for Context {
             executor.panicker.clone(),
             Arc::clone(&parent),
         );
-        Tasks::register_work(&executor.tasks, label, Box::pin(f));
+        Tasks::register_work(&executor.tasks, label, name, Box::pin(f));
 
         // Register the task on the parent
         if let Some(aborter) = handle.aborter() {
@@ -1666,6 +1782,98 @@ mod tests {
             reschedule().await;
         }
         i
+    }
+
+    struct ReversePolicy {
+        batches: Arc<Mutex<Vec<Vec<Name>>>>,
+    }
+
+    impl SchedulingPolicy for ReversePolicy {
+        fn order(&mut self, _virtual_time: SystemTime, ready: &mut [RunnableTask]) {
+            self.batches
+                .lock()
+                .push(ready.iter().map(|task| task.name().clone()).collect());
+            ready.reverse();
+        }
+    }
+
+    #[test]
+    fn test_scheduling_policy_orders_semantic_tasks() {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let policy = ReversePolicy {
+            batches: Arc::clone(&batches),
+        };
+        let runner =
+            deterministic::Runner::new(deterministic::Config::new().with_scheduling_policy(policy));
+        runner.start(|context| {
+            let order = Arc::clone(&order);
+            async move {
+                let first_order = Arc::clone(&order);
+                let first = context
+                    .child("worker")
+                    .with_attribute("index", 0)
+                    .spawn(move |_| async move { first_order.lock().push(0) });
+                let second = context
+                    .child("worker")
+                    .with_attribute("index", 1)
+                    .spawn(move |_| async move { order.lock().push(1) });
+                first.await.unwrap();
+                second.await.unwrap();
+            }
+        });
+
+        assert_eq!(*order.lock(), vec![1, 0]);
+        let batches = batches.lock();
+        let workers = batches.iter().find(|batch| batch.len() == 2).unwrap();
+        assert_eq!(workers[0].label, "worker");
+        assert_eq!(
+            workers[0].attributes,
+            [("index".to_string(), "0".to_string())]
+        );
+        assert_eq!(
+            workers[1].attributes,
+            [("index".to_string(), "1".to_string())]
+        );
+    }
+
+    struct CaptureActivations(Arc<Mutex<Vec<Vec<u64>>>>);
+
+    impl SchedulingPolicy for CaptureActivations {
+        fn order(&mut self, _virtual_time: SystemTime, ready: &mut [RunnableTask]) {
+            self.0
+                .lock()
+                .push(ready.iter().map(RunnableTask::activation).collect());
+        }
+    }
+
+    #[test]
+    fn test_scheduling_policy_distinguishes_duplicate_wakes() {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let runner = deterministic::Runner::new(
+            deterministic::Config::new()
+                .with_scheduling_policy(CaptureActivations(Arc::clone(&batches))),
+        );
+        runner.start(|context| async move {
+            let mut first_poll = true;
+            context
+                .child("worker")
+                .spawn(move |_| {
+                    futures::future::poll_fn(move |cx| {
+                        if std::mem::take(&mut first_poll) {
+                            cx.waker().wake_by_ref();
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(())
+                        }
+                    })
+                })
+                .await
+                .unwrap();
+        });
+
+        assert!(batches.lock().iter().any(|batch| batch == &[0, 1]));
     }
 
     fn run_tasks(tasks: usize, runner: deterministic::Runner) -> (String, Vec<usize>) {
