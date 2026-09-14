@@ -514,7 +514,7 @@ type VisibleFiles = BTreeMap<(String, Vec<u8>), (VisibleBlob, BlobVersion)>;
 ///
 /// All opens in one runtime share a blob incarnation. Durability still belongs to the
 /// wrapped deterministic storage: discard this context and its blobs before restarting
-/// from a checkpoint. Access each partition through this wrapper for mutations; direct
+/// from a checkpoint. Access each partition through this wrapper for mutations. Direct
 /// opens through the inner context may be used to inspect its durable contents.
 /// Storage fault injection must be disabled, and mutations must complete before reopening.
 #[cfg(any(test, feature = "test-utils"))]

@@ -203,6 +203,21 @@ stability_scope!(BETA, cfg(not(target_arch = "wasm32")) {
             let _ = sender.send(Some(result));
         }
 
+        /// Wait for an outstanding obligation of a name to finish, leaving its result to the open.
+        ///
+        /// Opening reads the file only after this returns, so the length it reports covers the
+        /// writes that were still in flight when the previous open's last handle dropped.
+        pub(crate) async fn settle(&self, partition: &str, name: &[u8]) {
+            let receiver = self
+                .syncs
+                .lock()
+                .get(&(partition.to_owned(), name.to_vec()))
+                .and_then(|entry| entry.sync.clone());
+            if let Some(mut receiver) = receiver {
+                let _ = receiver.wait_for(Option::is_some).await;
+            }
+        }
+
         /// Wait for the obligation captured when the file was opened.
         pub(crate) async fn wait(receiver: Option<Receiver>) -> Result<(), Error> {
             let Some(mut receiver) = receiver else {
@@ -390,6 +405,23 @@ stability_scope!(BETA, cfg(not(target_arch = "wasm32")) {
                 }
             }
         }
+    }
+
+    /// A write whose future was dropped lands before the next open reports the blob's length.
+    #[cfg(test)]
+    pub(crate) async fn check_orphaned_write<S: crate::Storage>(storage: &S) {
+        let (blob, _) = storage.open("orphaned_write", b"blob").await.unwrap();
+        let mut write = Box::pin(blob.write_at(0, b"orphaned", WriteOptions::default()));
+        let _ = futures::poll!(write.as_mut());
+        drop(write);
+        drop(blob);
+
+        let (blob, len) = storage.open("orphaned_write", b"blob").await.unwrap();
+        assert_eq!(len, 8);
+        let read = blob.read_at(0, 8, ReadOptions::default()).await.unwrap();
+        assert_eq!(read.coalesce().as_ref(), b"orphaned");
+        drop(blob);
+        storage.remove("orphaned_write", None).await.unwrap();
     }
 
     #[cfg(test)]

@@ -671,12 +671,11 @@ stability_scope!(BETA {
     ///
     /// The same holds for a blob reopened within a run. A blob has one open at
     /// a time, see [`Storage::open_versioned`]. Once every handle to a blob has
-    /// been dropped and every operation issued through those handles has
-    /// completed (its future was awaited, or its [`Blob::start_sync`] handle
-    /// resolved), a handle returned by a later open reads only crash-durable
-    /// bytes. Writes and resizes that no completed sync covered are either made
-    /// durable before the open returns or are not visible through the new
-    /// handle.
+    /// been dropped, a handle returned by a later open reads only crash-durable
+    /// bytes, even when operations issued through the dropped handles were
+    /// cancelled or are still in flight. Writes and resizes that no completed
+    /// sync covered are either made durable before the open returns or are not
+    /// visible through the new handle.
     ///
     /// # Cancellation
     ///
@@ -876,18 +875,17 @@ stability_scope!(BETA {
     ///
     /// Dropping the last clone of a blob whose writes or resizes are not covered
     /// by a completed [Blob::sync] does not make them durable at a known point.
-    /// A runtime may sync them afterwards, surfacing a failure only to the next
-    /// [Storage::open_versioned] of the same blob, or a later handle may not see
-    /// them at all. Call `sync` before dropping to make changes durable and to
-    /// observe errors.
+    /// A runtime may sync them afterwards, surfacing a failure to later
+    /// [Storage::open_versioned] calls for the same blob until it is removed, or a
+    /// later handle may not see them at all. Call `sync` before dropping to make
+    /// changes durable and to observe errors.
     ///
     /// # Durability
     ///
     /// After a crash, a write not covered by a completed [Blob::sync] may be torn: any
     /// subset of its bytes may be durable. Bytes outside the written range remain
-    /// unchanged. A blob reopened within a run after every clone was dropped and every
-    /// operation issued through them completed reads only bytes a sync covered, see the
-    /// `Storage` durability notes.
+    /// unchanged. A blob reopened within a run after every clone was dropped reads only
+    /// bytes a sync covered, see the `Storage` durability notes.
     #[allow(clippy::len_without_is_empty)]
     pub trait Blob: Clone + Send + Sync + 'static {
         /// Read exactly `len` bytes at `offset` into caller-provided buffers.

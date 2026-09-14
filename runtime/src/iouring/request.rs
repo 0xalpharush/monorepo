@@ -14,7 +14,7 @@ use super::{
     sockaddr::SockAddr,
     waiter::{WaiterId, WaiterState},
 };
-use crate::{Error, IoBuf, IoBufMut, IoBufs, storage::hold::Held};
+use crate::{Error, IoBuf, IoBufMut, IoBufs, storage::iouring::Shared};
 use io_uring::{opcode, squeue::Entry as SqueueEntry, types::Fd};
 use std::{
     fs::File,
@@ -274,14 +274,20 @@ impl Request {
                     },
                 )
             }
-            Self::WriteAt(r) => (
-                RequestOutput::WriteAt(result),
-                RetiredResources::File {
-                    _file: r.file,
-                    _cache: Some(r.cache),
-                    _write: Some(r.write),
-                },
-            ),
+            Self::WriteAt(r) => {
+                // Only plain writes stay in `Writing`. Settle here so a caller that stopped
+                // waiting still leaves the open's debt correct.
+                r.file
+                    .wrote(r.state != WriteAtState::Writing, result.is_ok());
+                (
+                    RequestOutput::WriteAt(result),
+                    RetiredResources::File {
+                        _file: r.file,
+                        _cache: Some(r.cache),
+                        _write: Some(r.write),
+                    },
+                )
+            }
             Self::Sync(r) => (
                 RequestOutput::Sync(result),
                 RetiredResources::File {
@@ -345,10 +351,10 @@ pub enum RetiredResources {
         /// Original byte owners, including consumed chunks.
         _write: WriteBuffers,
     },
-    /// File, directory hold, and any positioned I/O buffer/cache owners.
+    /// Open, directory hold, and any positioned I/O buffer/cache owners.
     File {
-        /// File owner carrying its original storage directory hold.
-        _file: Arc<Held>,
+        /// Open that issued the request, carrying its file, directory hold, and sync obligation.
+        _file: Arc<Shared>,
         /// Shared capability state retained by positioned I/O.
         _cache: Option<Cache>,
         /// Original write owners, absent for reads and standalone sync.
@@ -530,8 +536,8 @@ impl RecvRequest {
 
 /// Logical positioned file read request and its in-loop state.
 pub struct ReadAtRequest {
-    /// File used by the current read SQE.
-    pub file: Arc<Held>,
+    /// Open whose file the current read SQE uses.
+    pub file: Arc<Shared>,
     /// Starting file offset for the logical read.
     pub offset: u64,
     /// Bytes already read into `buf`.
@@ -667,8 +673,8 @@ fn on_sync_cqe(state: WaiterState, result: i32) -> Option<Result<(), Error>> {
 
 /// Logical positioned file write request and its in-loop state.
 pub struct WriteAtRequest {
-    /// File used by the current write SQE.
-    pub file: Arc<Held>,
+    /// Open whose file the current write SQE uses.
+    pub file: Arc<Shared>,
     /// File offset for the next write SQE.
     pub offset: u64,
     /// Write cursor and buffers that still need to be written.
@@ -758,8 +764,8 @@ impl WriteAtRequest {
 
 /// Logical fsync request and its in-loop state.
 pub struct SyncRequest {
-    /// File descriptor to sync.
-    pub file: Arc<Held>,
+    /// Open whose file the fsync SQE uses.
+    pub file: Arc<Shared>,
 }
 
 impl SyncRequest {
@@ -865,7 +871,7 @@ mod tests {
     }
 
     /// Retain a descriptor and directory hold for simulated storage requests.
-    fn make_file_fd() -> Arc<Held> {
+    fn make_file_fd() -> Arc<Shared> {
         let (left, _right) = UnixStream::pair().expect("failed to create unix socket pair");
         let file = File::from(OwnedFd::from(left));
 
@@ -878,7 +884,7 @@ mod tests {
             )
             .unwrap()
         });
-        Held::new(file, hold.clone())
+        Shared::detached(file, hold.clone())
     }
 
     /// Create a five-byte send with no deadline.

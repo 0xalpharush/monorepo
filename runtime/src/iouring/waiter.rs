@@ -502,7 +502,7 @@ pub mod tests {
             },
             slab::tests::set_generation,
         },
-        storage::hold::{Held, Hold},
+        storage::{hold::Hold, iouring::Shared},
     };
     use std::{
         fs::File,
@@ -535,7 +535,7 @@ pub mod tests {
     }
 
     /// Share one directory hold across the simulated file requests in this process.
-    fn held(file: File) -> Arc<Held> {
+    fn held(file: File) -> Arc<Shared> {
         static HOLD: OnceLock<Arc<Hold>> = OnceLock::new();
         let hold = HOLD.get_or_init(|| {
             Hold::acquire(
@@ -544,7 +544,7 @@ pub mod tests {
             )
             .unwrap()
         });
-        Held::new(file, hold.clone())
+        Shared::detached(file, hold.clone())
     }
 
     /// Build a socket descriptor for SQE construction without kernel submission.

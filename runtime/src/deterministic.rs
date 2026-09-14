@@ -1954,6 +1954,56 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "is already open")]
+    fn test_open_while_handle_alive_panics() {
+        deterministic::Runner::default().start(|context| async move {
+            let (blob, _) = context.open("partition", b"blob").await.unwrap();
+            let _ = context.open("partition", b"blob").await;
+            drop(blob);
+        });
+    }
+
+    /// Removing a blob frees its name while the removed handle lives.
+    #[test]
+    fn test_removed_blob_reopens_while_handle_alive() {
+        deterministic::Runner::default().start(|context| async move {
+            let (old, _) = context.open("partition", b"blob").await.unwrap();
+            old.write_at(0, b"old", WriteOptions::default())
+                .await
+                .unwrap();
+            context.remove("partition", None).await.unwrap();
+            let (current, len) = context.open("partition", b"blob").await.unwrap();
+            assert_eq!(len, 0);
+            drop(old);
+            current
+                .write_at(0, b"new", WriteOptions::default())
+                .await
+                .unwrap();
+            current.sync().await.unwrap();
+            let read = current
+                .read_at(0, 3, ReadOptions::default())
+                .await
+                .unwrap()
+                .coalesce();
+            assert_eq!(read.as_ref(), b"new");
+        });
+    }
+
+    /// Dropping a removed handle must not release the replacement's open.
+    #[test]
+    #[should_panic(expected = "is already open")]
+    fn test_removed_handle_drop_keeps_replacement_open() {
+        deterministic::Runner::default().start(|context| async move {
+            let (old, _) = context.open("partition", b"blob").await.unwrap();
+            context.remove("partition", Some(b"blob")).await.unwrap();
+            let (current, _) = context.open("partition", b"blob").await.unwrap();
+            drop(old);
+            let _ = context.open("partition", b"blob").await;
+            drop(current);
+        });
+    }
+
+    #[test]
     fn test_recover_synced_storage_persists() {
         // Initialize the first runtime
         let executor1 = deterministic::Runner::default();

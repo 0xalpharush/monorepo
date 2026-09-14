@@ -95,6 +95,10 @@ impl crate::Storage for Storage {
     ) -> Result<(Self::Blob, u64, BlobVersion), Error> {
         super::validate_partition_name(partition)?;
 
+        // Read the file only after the previous open's deferred sync landed, so the returned
+        // length covers every write that was still in flight when its last handle dropped.
+        self.pending.settle(partition, name).await;
+
         // Construct the full path
         let path = self.cfg.storage_directory.join(partition).join(hex(name));
         let storage_directory = self.cfg.storage_directory.clone();
@@ -1048,6 +1052,19 @@ mod tests {
             test_pool(),
         );
         super::super::check_sync_writes(&storage, &storage.pending).await;
+        drop(storage);
+        let _ = std::fs::remove_dir_all(storage_directory);
+    }
+
+    #[tokio::test]
+    async fn test_orphaned_write_lands_before_reopen() {
+        let storage_directory =
+            env::temp_dir().join(format!("storage_tokio_orphaned_{}", random_suffix()));
+        let storage = Storage::new(
+            Config::new(storage_directory.clone(), Layout::ALL),
+            test_pool(),
+        );
+        super::super::check_orphaned_write(&storage).await;
         drop(storage);
         let _ = std::fs::remove_dir_all(storage_directory);
     }

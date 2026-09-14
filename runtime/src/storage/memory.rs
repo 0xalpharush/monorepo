@@ -59,6 +59,9 @@ impl Generations {
 }
 
 /// In-memory storage implementation for the commonware runtime.
+///
+/// Opening a blob that is already open returns a second, independent handle. The runtime
+/// wrapping this storage enforces the one-open rule of [crate::Storage].
 #[derive(Clone)]
 pub struct Storage {
     partitions: Arc<Mutex<BTreeMap<String, Partition>>>,

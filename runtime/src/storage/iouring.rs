@@ -8,10 +8,11 @@
 //! handles retain no ring identity, so resources can move between workers
 //! between operations. Metadata and resize remain synchronous.
 //!
-//! A shared directory hold follows each blob's file into registered requests.
-//! Dropping a caller never releases that hold while the kernel can still access
-//! the file. Registered writes and syncs finish their logical work after caller
-//! cancellation, including requests still queued for staging capacity.
+//! Registered requests retain the open they were issued through, with its file,
+//! directory hold, and sync obligation. Dropping a caller never releases them
+//! while the kernel can still access the file. Registered writes and syncs finish
+//! their logical work after caller cancellation, including requests still queued
+//! for staging capacity.
 //!
 //! ## Memory Safety
 //!
@@ -113,6 +114,10 @@ impl crate::Storage for Storage {
         versions: RangeInclusive<BlobVersion>,
     ) -> Result<(Blob, u64, BlobVersion), Error> {
         super::validate_partition_name(partition)?;
+
+        // Read the file only after the previous open's deferred sync landed, so the returned
+        // length covers every write that was still in flight when its last handle dropped.
+        self.pending.settle(partition, name).await;
 
         let (blob, logical_len, blob_version, wait) = {
             // Acquire the filesystem lock
@@ -288,11 +293,12 @@ pub struct Blob {
 
 /// A blob's file with the writes no completed sync covers.
 ///
-/// Dropping the last reference resolves the obligation its open registered: at once when a
-/// completed sync covers every mutation, and otherwise through a sync of the file that the next
-/// open of the blob waits for. Registered requests retain the file and the directory hold on
-/// their own, so the sync runs once the handles and detached syncs of the open are gone.
-struct Shared {
+/// Every request issued through the open retains it, so it carries the directory hold into the
+/// ring and keeps the open's obligation pending until the kernel has finished with the file.
+/// Dropping the last reference resolves that obligation: at once when a completed sync covers
+/// every mutation, and otherwise through a sync of the file that the next open of the blob
+/// waits for.
+pub(crate) struct Shared {
     file: Arc<Held>,
     tracker: Tracker,
     pending: Arc<Pending>,
@@ -316,6 +322,43 @@ impl Drop for Shared {
             file.sync_data()
                 .map_err(|e| Error::BlobSyncFailed(key.0.clone(), hex(&key.1), e.into()))
         });
+    }
+}
+
+impl Shared {
+    /// Settle a write's mutation debt from the outcome the ring observed.
+    ///
+    /// The ring sees every completion, including those the caller stopped waiting for. A plain
+    /// write recorded its mutation before submission and completes it here. A durable write
+    /// covers itself, so it records a mutation only when it fails.
+    pub(crate) fn wrote(&self, durable: bool, ok: bool) {
+        match (durable, ok) {
+            (false, true) => self.tracker.complete(),
+            (true, false) => self.tracker.write(),
+            _ => {}
+        }
+    }
+}
+
+impl Deref for Shared {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
+#[cfg(test)]
+impl Shared {
+    /// Retain a file and directory hold for requests issued outside any open.
+    pub(crate) fn detached(file: File, hold: Arc<Hold>) -> Arc<Self> {
+        Arc::new(Self {
+            file: Held::new(file, hold),
+            tracker: Tracker::default(),
+            pending: Arc::new(Pending::default()),
+            key: (String::new(), Vec::new()),
+            promise: Mutex::new(None),
+        })
     }
 }
 
@@ -429,7 +472,7 @@ impl crate::Blob for Blob {
             Cache::Enabled
         };
         let output = Operation::register(Request::ReadAt(ReadAtRequest {
-            file: self.open.file.clone(),
+            file: self.open.shared.clone(),
             offset,
             read: 0,
             buf: io_buf,
@@ -496,11 +539,13 @@ impl crate::Blob for Blob {
         } else {
             0
         };
+        // A plain write records its mutation before submission. The ring settles the debt at
+        // completion through [Shared::wrote], so a caller that stops waiting changes nothing.
         if !sync {
             self.open.tracker.write();
         }
         let result = match Operation::register(Request::WriteAt(WriteAtRequest {
-            file: self.open.file.clone(),
+            file: self.open.shared.clone(),
             offset,
             write: bufs.into(),
             state,
@@ -512,11 +557,8 @@ impl crate::Blob for Blob {
             Ok(_) => unreachable!("write request returned another output kind"),
             Err(_) => Err(Error::WriteFailed),
         };
-        match (&result, sync) {
-            (Ok(()), false) => self.open.tracker.complete(),
-            (Ok(()), true) if covers_file => self.open.tracker.end_sync(seen),
-            (Err(_), true) => self.open.tracker.write(),
-            _ => {}
+        if result.is_ok() && covers_file {
+            self.open.tracker.end_sync(seen);
         }
         result
     }
@@ -544,7 +586,7 @@ impl crate::Blob for Blob {
         let (partition, name) = &self.open.key;
         let seen = self.open.tracker.begin_sync();
         let output = Operation::register(Request::Sync(SyncRequest {
-            file: self.open.file.clone(),
+            file: self.open.shared.clone(),
         }))
         .await
         .map_err(|error| {
@@ -570,7 +612,7 @@ impl crate::Blob for Blob {
         let shared = self.open.shared.clone();
         let seen = shared.tracker.begin_sync();
         let receiver = operation::start_sync(SyncRequest {
-            file: shared.file.clone(),
+            file: shared.clone(),
         });
         Handle::from_future(async move {
             match receiver.await {
@@ -1661,6 +1703,51 @@ mod tests {
         });
     }
 
+    /// A durable write that fails after its caller stopped waiting still dirties the open, so
+    /// the last release syncs whatever the write left behind.
+    #[test]
+    fn test_orphaned_failed_durable_write_syncs_on_release() {
+        // One batch fuses the sync into the write. More batches end in a trailing sync.
+        for chunks in [1, IOVEC_BATCH_SIZE + 1] {
+            let directory = create_test_directory();
+            let path = directory.join("readonly");
+            fs::write(&path, b"").unwrap();
+            let hold = Hold::acquire(&directory).unwrap();
+            let mut registry = Registry::default();
+            let pending = Arc::new(Pending::default());
+            let blob = Blob::new(
+                File::options().read(true).open(&path).unwrap(),
+                hold,
+                test_pool(&mut registry),
+                0,
+                pending.attach("partition", b"readonly").0,
+            );
+
+            iouring::Runner::default().start(|_| async move {
+                let bufs = IoBufs::from((0..chunks).map(|_| IoBuf::from(b"x")).collect::<Vec<_>>());
+                let mut write = Box::pin(blob.write_at(0, bufs, WriteOptions::SYNC));
+                assert!(futures::poll!(write.as_mut()).is_pending());
+                drop(write);
+                drop(blob);
+            });
+
+            // The write failed against the read-only descriptor after its caller left, so the
+            // retired request dirtied the open and its release ran the deferred sync.
+            assert_eq!(pending.finished(), 1, "chunks={chunks}");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_orphaned_write_lands_before_reopen() {
+        iouring::Runner::default().start(|_| async {
+            let (storage, storage_directory) = create_test_storage();
+            super::super::check_orphaned_write(&storage).await;
+            drop(storage);
+            let _ = std::fs::remove_dir_all(storage_directory);
+        });
+    }
+
     /// A dirty handle of a removed blob defers nothing when it drops, and a dirty drop before
     /// the unlink still syncs.
     #[test]
@@ -1857,6 +1944,39 @@ mod tests {
 
             drop(storage);
             let _ = std::fs::remove_dir_all(&storage_directory);
+        });
+    }
+
+    /// A dropped write keeps its open alive, so the drop sync runs after the write lands and
+    /// the next open reads only bytes that sync covered.
+    #[test]
+    fn test_orphaned_write_delays_drop_sync() {
+        iouring::Runner::default().start(|_| async {
+            let (storage, storage_directory) = create_test_storage();
+            let (blob, _) = storage.open("partition", b"orphaned").await.unwrap();
+            let mut write = Box::pin(blob.write_at(0, b"orphaned", WriteOptions::default()));
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            drop(write);
+            drop(blob);
+
+            // The registered write still owns the open, so its obligation stays unresolved.
+            assert_eq!(storage.pending.len(), 1);
+            assert_eq!(storage.pending.finished(), 0);
+
+            // The reopen waits for the write to retire and for the sync that covers it.
+            let (blob, len) = storage.open("partition", b"orphaned").await.unwrap();
+            assert_eq!(len, 8);
+            assert_eq!(storage.pending.len(), 0);
+            assert_eq!(storage.pending.finished(), 1);
+            let read = blob
+                .read_at(0, 8, ReadOptions::default())
+                .await
+                .unwrap()
+                .coalesce();
+            assert_eq!(read.as_ref(), b"orphaned");
+            drop(blob);
+            drop(storage);
+            let _ = std::fs::remove_dir_all(storage_directory);
         });
     }
 
