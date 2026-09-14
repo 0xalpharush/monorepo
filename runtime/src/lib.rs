@@ -929,13 +929,16 @@ stability_scope!(BETA {
         /// If the length is less than the current length, the blob is resized.
         fn resize(&self, len: u64) -> impl Future<Output = Result<(), Error>> + Send;
 
-        /// Ensure all pending data is durably persisted.
+        /// Make every write and resize that completed before this call durable.
         ///
-        /// A runtime may return at once when no mutation issued through this blob's clones
-        /// remains uncovered by a completed sync, so callers may sync freely.
+        /// A write still in flight on another clone is covered by its own
+        /// [`WriteOptions::SYNC`] or by a later sync, not by this one. A runtime may
+        /// return at once when every completed mutation is already covered, so
+        /// callers may sync freely.
         fn sync(&self) -> impl Future<Output = Result<(), Error>> + Send;
 
-        /// Request that all pending data is durably persisted.
+        /// Request that every write and resize that completed before this call is
+        /// made durable.
         ///
         /// Awaiting this future waits until the runtime accepts responsibility for
         /// the sync. It continues even if the returned [`Handle`] is dropped.

@@ -296,7 +296,7 @@ stability_scope!(BETA, cfg(not(target_arch = "wasm32")) {
         }
 
         /// Record a sync that found nothing to persist. Callers sync freely and the runtime
-        /// skips the device flush when every mutation through the open is already covered.
+        /// skips the device flush when every completed mutation through the open is covered.
         #[cfg(test)]
         pub(crate) fn skip_sync(&self) {
             self.skipped.fetch_add(1, Ordering::AcqRel);
