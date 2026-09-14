@@ -170,6 +170,15 @@ As the chain produces more data, each replica has more to receive, store, and de
 
 We use [tracer](https://github.com/clabby/tracer) to study these tradeoffs across deployed clusters. It aggregates traces from every replica so we can compare the same consensus round on a shared timeline, see which replicas lag, and identify the phases responsible. Diffing round traces before and after a change shows whether speeding up one operation made another wait longer.
 
+```{=html}
+<figure aria-describedby="tracer-caption">
+  <img src="https://private-user-images.githubusercontent.com/8406232/606233044-670cd813-4f38-4961-9a32-f6f5202a2202.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3ODkzNTM5MTAsIm5iZiI6MTc4OTM1MzYxMCwicGF0aCI6Ii84NDA2MjMyLzYwNjIzMzA0NC02NzBjZDgxMy00ZjM4LTQ5NjEtOWEzMi1mNmY1MjAyYTIyMDIucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDkxNCUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjA5MTRUMDI0MDEwWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9MDlkY2U5ZmMxMjk3ODc0NWQxNDZjMTYwMGQzZWMzMTAzYzg4YzU1ZDE4YTcxZjU4Mzk4ZTFmZTJiMzZjZDlkMSZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QmcmVzcG9uc2UtY29udGVudC10eXBlPWltYWdlJTJGcG5nIn0.V1F4qxnC3vOP6o5vqtdMeEgWCrJsTzUEx_XGYy_zsI0" />
+  <figcaption id="tracer-caption">
+    Figure 8. A visualized aggregation of consensus round traces across several instances using the tracer tool.
+  </figcaption>
+</figure>
+```
+
 Traces include time spent waiting for disk, so we use [samply](https://github.com/mstange/samply) alongside them to find where the CPU is busy. Its profiles show time spent decoding records, copying buffers, or maintaining indexes. Combined with resource metrics, these can lead us into the codec, archive, and runtime primitives beneath marshal, where improvements benefit other components too.
 
 Multimmit's Marshal gives us a demanding place to test the primitives we build at Commonware. We want the next application to benefit from this work without its developers having to repeat it.
