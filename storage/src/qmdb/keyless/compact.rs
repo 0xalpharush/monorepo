@@ -1952,7 +1952,7 @@ mod tests {
                     .await;
                 let (db, _) = db.apply_batch(batch).await.unwrap();
                 let db = db.commit().await.unwrap();
-                // Commit persists witness data; sync must also persist recovery metadata
+                // Commit persists witness data. Sync must also persist recovery metadata.
                 let db = db.sync().await.unwrap();
                 db.root()
             };
