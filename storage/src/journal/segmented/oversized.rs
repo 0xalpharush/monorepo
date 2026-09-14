@@ -1551,8 +1551,9 @@ mod tests {
         for cap in [2 * TestEntry::SIZE as u64, u64::MAX] {
             deterministic::Runner::default().start(|context| async move {
                 let cfg = test_cfg(&context);
+                let seed = context.child("seed");
                 let mut replay = Oversized::<_, TestEntry, TestValue>::init_with_metadata(
-                    &context.child("seed"),
+                    &seed,
                     cfg.clone(),
                     "markers".into(),
                     ReadOptions::default(),
@@ -1578,8 +1579,9 @@ mod tests {
 
                 let (context, recordings) =
                     commonware_runtime::mocks::RecordingContext::new(context);
+                let reopen = context.child("reopen");
                 let mut replay = Oversized::<_, TestEntry, TestValue>::init_with_metadata_at_most(
-                    &context.child("reopen"),
+                    &reopen,
                     cfg,
                     "markers".into(),
                     ReadOptions::default(),
