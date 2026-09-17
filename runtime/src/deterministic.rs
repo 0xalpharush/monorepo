@@ -93,7 +93,7 @@ use rand::{CryptoRng, Rng, SeedableRng, TryCryptoRng, TryRng, prelude::SliceRand
 use rayon::{ThreadPoolBuildError, ThreadPoolBuilder};
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap},
     convert::Infallible,
     mem::{replace, take},
     net::{IpAddr, SocketAddr},
@@ -702,6 +702,8 @@ impl Runner {
                 );
                 let mut output = None;
                 for id in queue {
+                    executor.tasks.dequeue(id);
+
                     // Lookup the task (it may have completed already)
                     let Some(task) = executor.tasks.get(id) else {
                         trace!(id, "skipping missing task");
@@ -900,9 +902,15 @@ struct Tasks {
     /// Next generation for each semantic supervisor name.
     generations: Mutex<BTreeMap<Vec<u8>, u64>>,
     /// Tasks ready to be polled.
-    ready: Mutex<Vec<u128>>,
+    ready: Mutex<ReadyTasks>,
     /// All running tasks.
     running: Mutex<BTreeMap<u128, Arc<Task>>>,
+}
+
+#[derive(Default)]
+struct ReadyTasks {
+    queue: Vec<u128>,
+    queued: BTreeSet<u128>,
 }
 
 impl Tasks {
@@ -911,7 +919,7 @@ impl Tasks {
         Self {
             counter: Mutex::new(0),
             generations: Mutex::new(BTreeMap::new()),
-            ready: Mutex::new(Vec::new()),
+            ready: Mutex::new(ReadyTasks { queue: Vec::new(), queued: BTreeSet::new() }),
             running: Mutex::new(BTreeMap::new()),
         }
     }
@@ -987,19 +995,26 @@ impl Tasks {
     /// Enqueue an already registered task to be executed.
     fn queue(&self, id: u128) {
         let mut ready = self.ready.lock();
-        ready.push(id);
+        if ready.queued.insert(id) {
+            ready.queue.push(id);
+        }
     }
 
     /// Drain all ready tasks.
     fn drain(&self) -> Vec<u128> {
-        let mut queue = self.ready.lock();
-        let len = queue.len();
-        replace(&mut *queue, Vec::with_capacity(len))
+        let mut ready = self.ready.lock();
+        let len = ready.queue.len();
+        replace(&mut ready.queue, Vec::with_capacity(len))
+    }
+
+    /// Mark a snapshotted task as no longer queued immediately before polling it.
+    fn dequeue(&self, id: u128) {
+        self.ready.lock().queued.remove(&id);
     }
 
     /// The number of ready tasks.
     fn ready(&self) -> usize {
-        self.ready.lock().len()
+        self.ready.lock().queue.len()
     }
 
     /// Lookup a task.
@@ -1014,12 +1029,17 @@ impl Tasks {
     /// Remove a task.
     fn remove(&self, id: u128) {
         self.running.lock().remove(&id);
+        self.ready.lock().queued.remove(&id);
     }
 
     /// Clear all tasks.
     fn clear(&self) -> Vec<Arc<Task>> {
         // Clear ready
-        self.ready.lock().clear();
+        {
+            let mut ready = self.ready.lock();
+            ready.queue.clear();
+            ready.queued.clear();
+        }
 
         // Clear running tasks
         let running: BTreeMap<u128, Arc<Task>> = {
@@ -1848,19 +1868,19 @@ mod tests {
     }
 
     #[test]
-    fn test_scheduling_policy_distinguishes_duplicate_wakes() {
+    fn test_scheduling_policy_coalesces_duplicate_wakes() {
         let batches = Arc::new(Mutex::new(Vec::new()));
         let runner = deterministic::Runner::new(
             deterministic::Config::new()
                 .with_scheduling_policy(CaptureActivations(Arc::clone(&batches))),
         );
         runner.start(|context| async move {
-            let mut first_poll = true;
-            context
+            let mut worker_first_poll = true;
+            let worker = context
                 .child("worker")
                 .spawn(move |_| {
                     futures::future::poll_fn(move |cx| {
-                        if std::mem::take(&mut first_poll) {
+                        if std::mem::take(&mut worker_first_poll) {
                             cx.waker().wake_by_ref();
                             cx.waker().wake_by_ref();
                             Poll::Pending
@@ -1868,12 +1888,27 @@ mod tests {
                             Poll::Ready(())
                         }
                     })
+                });
+            let mut companion_first_poll = true;
+            let companion = context.child("companion").spawn(move |_| {
+                futures::future::poll_fn(move |cx| {
+                    if std::mem::take(&mut companion_first_poll) {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(())
+                    }
                 })
-                .await
-                .unwrap();
+            });
+            worker.await.unwrap();
+            companion.await.unwrap();
         });
 
-        assert!(batches.lock().iter().any(|batch| batch == &[0, 1]));
+        let batches = batches.lock();
+        assert!(!batches.is_empty());
+        assert!(
+            batches.iter().all(|batch| batch.iter().all(|activation| *activation == 0))
+        );
     }
 
     fn run_tasks(tasks: usize, runner: deterministic::Runner) -> (String, Vec<usize>) {
