@@ -5,7 +5,7 @@ use crate::{
 };
 use commonware_actor::Feedback;
 use commonware_cryptography::PublicKey;
-use commonware_runtime::{Clock, IoBuf, Quota};
+use commonware_runtime::{Clock, IoBuf, Quota, deterministic::NetworkPolicy};
 use commonware_utils::{
     NZUsize, Probability,
     channel::{fallible::FallibleExt, mpsc, oneshot, ring},
@@ -13,7 +13,7 @@ use commonware_utils::{
     probability,
 };
 use rand_distr::Normal;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 pub enum Message<P: PublicKey, E: Clock> {
     Register {
@@ -69,6 +69,10 @@ pub enum Message<P: PublicKey, E: Clock> {
         faults: LinkFaults,
         result: oneshot::Sender<Result<(), Error>>,
     },
+    SetPolicy {
+        policy: Option<Arc<dyn NetworkPolicy<P>>>,
+        result: oneshot::Sender<()>,
+    },
     Block {
         /// The public key of the peer sending the block request.
         from: P,
@@ -117,6 +121,10 @@ impl<P: PublicKey, E: Clock> std::fmt::Debug for Message<P, E> {
             Self::SetLinkFaults { faults, .. } => f
                 .debug_struct("SetLinkFaults")
                 .field("faults", faults)
+                .finish_non_exhaustive(),
+            Self::SetPolicy { policy, .. } => f
+                .debug_struct("SetPolicy")
+                .field("policy", &policy.is_some())
                 .finish_non_exhaustive(),
             Self::Block { from, to } => f
                 .debug_struct("Block")
@@ -208,10 +216,21 @@ pub struct Link {
 /// A misdirected message keeps the latency sampled from the `A -> B` link, is charged to the
 /// egress of `A` and the ingress of `C`, and is ordered with other messages on the `A -> C`
 /// link. A duplicate of a misdirected message is also sent to `C`.
+///
+/// # Corruption
+///
+/// With probability `corrupt_rate`, one uniformly chosen bit of a delivered message is flipped.
+///
+/// These rates are shorthand for a [`NetworkPolicy`] (see [`Oracle::set_policy`]): each message's
+/// sampled latency, delivery, and faults form one [`NetworkDelivery`](commonware_runtime::deterministic::NetworkDelivery), carried out exactly as a
+/// policy's would be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LinkFaults {
     /// Probability that a delivered message is delivered a second time.
     pub duplicate_rate: Probability,
+
+    /// Probability that one bit of a delivered message is flipped.
+    pub corrupt_rate: Probability,
 
     /// Probability that a delivered message is delivered to a different peer.
     pub misdirect_rate: Probability,
@@ -222,6 +241,7 @@ impl LinkFaults {
     pub const NONE: Self = Self {
         duplicate_rate: probability!(0.0),
         misdirect_rate: probability!(0.0),
+        corrupt_rate: probability!(0.0),
     };
 }
 
@@ -388,6 +408,23 @@ impl<P: PublicKey, E: Clock> Oracle<P, E> {
         })
         .await
         .ok_or(Error::NetworkClosed)?
+    }
+
+    /// Decide every message with `policy` instead of each link's sampled latency, success rate,
+    /// and [LinkFaults], or restore them with `None`.
+    ///
+    /// The policy sees each message as a [`NetworkTransmission`](commonware_runtime::deterministic::NetworkTransmission) on its link (with its channel and
+    /// its index among the messages sent on that link) and returns a [`NetworkDelivery`](commonware_runtime::deterministic::NetworkDelivery). Messages
+    /// still need a link, and a [`NetworkFate::Reset`](commonware_runtime::deterministic::NetworkFate::Reset) drops the message (simulated links carry
+    /// messages, not connections). The same policy type drives the runtime's deterministic sockets,
+    /// which these links run over.
+    pub async fn set_policy(&self, policy: Option<Arc<dyn NetworkPolicy<P>>>) -> Result<(), Error> {
+        request(&self.sender, move |result| Message::SetPolicy {
+            policy,
+            result,
+        })
+        .await
+        .ok_or(Error::NetworkClosed)
     }
 
     /// Set the peers for a given id.

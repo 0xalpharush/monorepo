@@ -74,7 +74,8 @@ use crate::{
 use crate::{Blocker, Pacer};
 pub use crate::{
     network::deterministic::{
-        Delivery as NetworkDelivery, Link as NetworkLink, Policy as NetworkPolicy,
+        Delivery as NetworkDelivery, Fate as NetworkFate, Link as NetworkLink,
+        Policy as NetworkPolicy, Transmission as NetworkTransmission,
     },
     storage::faulty::{
         Config as FaultConfig, Decision as FaultDecision, Draw as FaultDraw, Op as StorageOp,
@@ -3680,17 +3681,55 @@ mod tests {
     struct ScriptedNetwork;
 
     impl NetworkPolicy for ScriptedNetwork {
-        fn connects(&self, _: SocketAddr, listener: SocketAddr) -> bool {
+        fn connects(&self, _: &SocketAddr, listener: &SocketAddr) -> bool {
             listener.port() != 4000
         }
 
-        fn delivers(&self, _: NetworkLink, index: u64, _: usize) -> NetworkDelivery {
-            match index {
-                0 => NetworkDelivery::After(Duration::from_millis(250)),
-                2 => NetworkDelivery::Reset,
-                _ => NetworkDelivery::After(Duration::ZERO),
+        fn delivers(&self, transmission: &NetworkTransmission<'_>) -> NetworkDelivery {
+            match transmission.index {
+                0 => NetworkDelivery::after(Duration::from_millis(250)),
+                2 => NetworkDelivery::RESET,
+                _ => NetworkDelivery::NOW,
             }
         }
+    }
+
+    /// Corrupts a link's first send, duplicates its second, and drops its third.
+    struct GarbledNetwork;
+
+    impl NetworkPolicy for GarbledNetwork {
+        fn delivers(&self, transmission: &NetworkTransmission<'_>) -> NetworkDelivery {
+            match transmission.index {
+                0 => NetworkDelivery::NOW.corrupted(8 * 2 + 5),
+                1 => NetworkDelivery::NOW.duplicated(Duration::from_millis(10)),
+                2 => NetworkDelivery::DROP,
+                _ => NetworkDelivery::NOW,
+            }
+        }
+    }
+
+    #[test]
+    fn test_network_policy_corrupts_duplicates_and_drops() {
+        use crate::{Listener as _, Network as _, Sink as _, Stream as _};
+        let cfg = deterministic::Config::default().with_network_policy(Arc::new(GarbledNetwork));
+        deterministic::Runner::new(cfg).start(|ctx| async move {
+            let address = SocketAddr::from(([127, 0, 0, 1], 4003));
+            let mut listener = ctx.bind(address).await.unwrap();
+            let (mut sink, _stream) = ctx.dial(address).await.unwrap();
+            let (_, _, mut stream) = listener.accept().await.unwrap();
+            sink.send(b"abcd".to_vec()).await.unwrap();
+            let start = ctx.current();
+            sink.send(b"xy".to_vec()).await.unwrap();
+            assert_eq!(
+                ctx.current().duration_since(start).unwrap(),
+                Duration::from_millis(10)
+            );
+            // Bit 5 of byte 2 flipped, then the duplicated send twice.
+            assert_eq!(stream.recv(8).await.unwrap().coalesce(), b"abCdxyxy");
+            // A stream cannot lose bytes without breaking: the drop resets the connection.
+            assert!(matches!(sink.send(b"z".to_vec()).await, Err(Error::Closed)));
+            assert!(stream.recv(1).await.is_err());
+        });
     }
 
     #[test]

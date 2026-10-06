@@ -3600,6 +3600,7 @@ mod tests {
         let faults = LinkFaults {
             duplicate_rate: probability!(0.5),
             misdirect_rate: probability!(0.25),
+            corrupt_rate: probability!(0.25),
         };
         let mut outputs = Vec::new();
         for seed in 0..5 {
@@ -3654,6 +3655,104 @@ mod tests {
                     IoBuf::from(b"second"),
                     IoBuf::from(b"first"),
                     IoBuf::from(b"second"),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn test_link_faults_corrupt_all() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let (oracle, keys, mut senders, mut log) = start_logged_network(&context, 2).await;
+            oracle
+                .add_link(keys[0].clone(), keys[1].clone(), FAULT_LINK)
+                .await
+                .unwrap();
+            oracle
+                .set_link_faults(
+                    keys[0].clone(),
+                    keys[1].clone(),
+                    LinkFaults {
+                        corrupt_rate: probability!(1.0),
+                        ..LinkFaults::NONE
+                    },
+                )
+                .await
+                .unwrap();
+            let sent = b"corrupt me".to_vec();
+            senders[0].send(Recipients::One(keys[1].clone()), sent.clone(), false);
+            context.sleep(Duration::from_secs(1)).await;
+            let received = drain(&mut log);
+            assert_eq!(received.len(), 1);
+            let flipped: u32 = received[0]
+                .2
+                .as_ref()
+                .iter()
+                .zip(&sent)
+                .map(|(received, sent)| (received ^ sent).count_ones())
+                .sum();
+            assert_eq!(flipped, 1, "exactly one bit flips");
+        });
+    }
+
+    /// Drops a link's first message, corrupts its second, duplicates its third, and misdirects
+    /// its fourth.
+    struct ScriptedMessages;
+
+    impl commonware_runtime::deterministic::NetworkPolicy<ed25519::PublicKey> for ScriptedMessages {
+        fn delivers(
+            &self,
+            transmission: &commonware_runtime::deterministic::NetworkTransmission<
+                '_,
+                ed25519::PublicKey,
+            >,
+        ) -> commonware_runtime::deterministic::NetworkDelivery {
+            use commonware_runtime::deterministic::NetworkDelivery;
+            assert!(transmission.channel.is_some());
+            let after = Duration::from_millis(5);
+            match transmission.index {
+                0 => NetworkDelivery::DROP,
+                1 => NetworkDelivery::after(after).corrupted(0),
+                2 => NetworkDelivery::after(after).duplicated(after),
+                3 => NetworkDelivery::after(after).misdirected(),
+                _ => NetworkDelivery::after(after),
+            }
+        }
+    }
+
+    #[test]
+    fn test_policy_decides_every_message() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let (oracle, keys, mut senders, mut log) = start_logged_network(&context, 3).await;
+            for (from, to) in [(0, 1), (0, 2)] {
+                oracle
+                    .add_link(keys[from].clone(), keys[to].clone(), FAULT_LINK)
+                    .await
+                    .unwrap();
+            }
+            oracle
+                .set_policy(Some(std::sync::Arc::new(ScriptedMessages)))
+                .await
+                .unwrap();
+            for message in [b"m0", b"m1", b"m2", b"m3", b"m4"] {
+                senders[0].send(Recipients::One(keys[1].clone()), message.to_vec(), false);
+                context.sleep(Duration::from_millis(50)).await;
+            }
+            context.sleep(Duration::from_secs(1)).await;
+            let received: Vec<_> = drain(&mut log)
+                .into_iter()
+                .map(|(to, _, message, _)| (to, message))
+                .collect();
+            assert_eq!(
+                received,
+                vec![
+                    (1, IoBuf::from(b"l1")),
+                    (1, IoBuf::from(b"m2")),
+                    (1, IoBuf::from(b"m2")),
+                    (2, IoBuf::from(b"m3")),
+                    (1, IoBuf::from(b"m4")),
                 ]
             );
         });
@@ -3822,6 +3921,7 @@ mod tests {
                     LinkFaults {
                         duplicate_rate: probability!(1.0),
                         misdirect_rate: probability!(1.0),
+                        ..LinkFaults::NONE
                     },
                 )
                 .await
