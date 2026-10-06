@@ -85,6 +85,15 @@ impl Storage {
         }
     }
 
+    /// Retire the live blob generations of every partition `affected` selects, so handles opened
+    /// before a crash can no longer publish into durable contents.
+    pub(crate) fn retire_partitions(&self, affected: &impl Fn(&str) -> bool) {
+        self.generations
+            .lock()
+            .current
+            .retain(|(partition, _), _| !affected(partition));
+    }
+
     /// Transfer durable contents and retire every live blob generation.
     pub(crate) fn take_snapshot(&self) -> Snapshot {
         let mut generations = self.generations.lock();
