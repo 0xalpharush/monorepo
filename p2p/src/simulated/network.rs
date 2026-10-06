@@ -548,7 +548,6 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
                     Ok(receiver) => Receiver { receiver },
                     Err(err) => return send_result(result, Err(err)),
                 };
-                peer.channels.insert(channel);
 
                 send_result(result, Ok((sender, receiver)))
             }
@@ -809,34 +808,6 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
                 || self.blocks.contains(&(b.clone(), a.clone())))
     }
 
-    /// Selects the peer that receives a message from `origin` misdirected away from `recipient`.
-    ///
-    /// See [LinkFaults] for the eligibility rules. Consumes randomness only when more than one
-    /// peer is eligible.
-    fn misdirect_target(&mut self, channel: Channel, origin: &P, recipient: &P) -> Option<P> {
-        let mut candidates: Vec<P> = self
-            .peers
-            .iter()
-            .filter(|(peer, state)| {
-                *peer != origin
-                    && *peer != recipient
-                    && state.channels.contains(&channel)
-                    && self.is_connectable(peer)
-                    && !self.is_blocked(origin, peer)
-                    && self.links.contains_key(&(origin.clone(), (*peer).clone()))
-            })
-            .map(|(peer, _)| peer.clone())
-            .collect();
-        match candidates.len() {
-            0 => None,
-            1 => candidates.pop(),
-            len => {
-                let index = self.context.as_mut().random_range(0..len);
-                Some(candidates.swap_remove(index))
-            }
-        }
-    }
-
     /// Re-send duplicate messages whose re-send time has been reached.
     fn process_replays(&mut self) {
         let now = self.context.current();
@@ -980,22 +951,9 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
                 None => Self::sample_delivery(self.context.as_mut(), link, message.len()),
             };
             let latency = delivery.after;
-            let mut should_deliver = delivery.fate == NetworkFate::Deliver;
+            let should_deliver = delivery.fate == NetworkFate::Deliver;
 
-            // Deliver to a different peer if misdirected
-            let mut destination = recipient;
-            if should_deliver && delivery.misdirect {
-                match self.misdirect_target(channel, &origin, &destination) {
-                    Some(target) => {
-                        trace!(?origin, intended = ?destination, ?target, "misdirecting message");
-                        destination = target;
-                    }
-                    None => {
-                        trace!(?origin, recipient = ?destination, "no misdirect target, dropping message");
-                        should_deliver = false;
-                    }
-                }
-            }
+            let destination = recipient;
 
             // Flip a bit if corrupted
             let message = match delivery.corrupt {
@@ -1038,7 +996,7 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
     /// Sample a message's delivery from `link`'s latency, success rate, and [LinkFaults].
     ///
     /// Draws latency and success first, then (only for delivered messages and nonzero rates)
-    /// misdirection, corruption, and duplication, so a link without faults draws as before.
+    /// corruption and duplication, so a link without faults draws as before.
     fn sample_delivery(context: &mut E, link: &Link, len: usize) -> NetworkDelivery {
         let latency = Duration::from_millis(link.sampler.sample(context) as u64);
         if !link.success_rate.sample(context) {
@@ -1049,9 +1007,6 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
         }
         let faults = link.faults;
         let mut delivery = NetworkDelivery::after(latency);
-        if faults.misdirect_rate.sample(context) {
-            delivery = delivery.misdirected();
-        }
         if len > 0 && faults.corrupt_rate.sample(context) {
             let bits = u64::try_from(len)
                 .expect("bounded message")
@@ -1520,9 +1475,6 @@ struct Peer<P: PublicKey> {
 
     // Control to register new channels
     control: mpsc::UnboundedSender<ChannelRegistration<P>>,
-
-    // Channels the peer has registered
-    channels: BTreeSet<Channel>,
 }
 
 impl<P: PublicKey> Peer<P> {
@@ -1639,7 +1591,6 @@ impl<P: PublicKey> Peer<P> {
         Self {
             socket,
             control: control_sender,
-            channels: BTreeSet::new(),
         }
     }
 
