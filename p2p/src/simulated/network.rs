@@ -21,7 +21,11 @@ use commonware_cryptography::PublicKey;
 use commonware_macros::select_loop;
 use commonware_runtime::{
     Clock, ContextCell, Handle, IoBuf, IoBufs, Listener as _, Metrics, Network as RNetwork, Quota,
-    Spawner, spawn_cell,
+    Spawner,
+    deterministic::{
+        NetworkDelivery, NetworkFate, NetworkLink, NetworkPolicy, NetworkTransmission,
+    },
+    spawn_cell,
     telemetry::metrics::{CounterFamily, MetricsExt as _},
 };
 use commonware_stream::utils::codec::{recv_frame, send_frame};
@@ -61,6 +65,21 @@ struct Replay<P> {
     recipient: P,
     message: IoBuf,
     latency: Duration,
+}
+
+/// Flip `bit` (modulo the message's length in bits) of `message`.
+fn flip(message: &IoBuf, bit: u64) -> IoBuf {
+    let mut bytes = message.as_ref().to_vec();
+    if bytes.is_empty() {
+        return message.clone();
+    }
+    let bits = u64::try_from(bytes.len())
+        .expect("bounded message")
+        .saturating_mul(8);
+    let bit = bit % bits;
+    let byte = usize::try_from(bit / 8).expect("bit within the message");
+    bytes[byte] ^= 1 << (bit % 8);
+    IoBuf::from(bytes)
 }
 
 /// Overhead from prepending a channel identifier to an application payload.
@@ -212,6 +231,9 @@ pub struct Network<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> 
     // Sequence used to order replays scheduled for the same time
     next_replay: u64,
 
+    // Decides every message instead of link sampling, if set
+    policy: Option<Arc<dyn NetworkPolicy<P>>>,
+
     // Subscribers to primary peer set updates (used by `Manager::subscribe`).
     subscribers: Vec<mpsc::UnboundedSender<PeerSetUpdate<P>>>,
 
@@ -265,6 +287,7 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
                 transmitter: transmitter::State::new(),
                 replays: BTreeMap::new(),
                 next_replay: 0,
+                policy: None,
                 subscribers: Vec::new(),
                 peer_subscribers: Vec::new(),
                 blocked_subscribers: Vec::new(),
@@ -624,6 +647,10 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
                 link.faults = faults;
                 send_result(result, Ok(()))
             }
+            ingress::Message::SetPolicy { policy, result } => {
+                self.policy = policy;
+                let _ = result.send(());
+            }
             ingress::Message::Block { from, to } => {
                 if self.blocks.insert((from.clone(), to)) {
                     self.notify_blocked(&from);
@@ -937,16 +964,27 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
                 .get_or_create(&metrics::Message::new(&origin, &recipient, channel))
                 .inc();
 
-            // Sample latency
-            let latency = Duration::from_millis(link.sampler.sample(self.context.as_mut()) as u64);
+            // Decide the message's delivery, by policy or by sampling the link
+            let index = link.sent;
+            link.sent = link.sent.checked_add(1).expect("message count overflow");
+            let delivery = match &self.policy {
+                Some(policy) => policy.delivers(&NetworkTransmission {
+                    link: &NetworkLink {
+                        from: origin.clone(),
+                        to: recipient.clone(),
+                    },
+                    channel: Some(channel),
+                    index,
+                    len: message.len(),
+                }),
+                None => Self::sample_delivery(self.context.as_mut(), link, message.len()),
+            };
+            let latency = delivery.after;
+            let mut should_deliver = delivery.fate == NetworkFate::Deliver;
 
-            // Determine if the message should be delivered
-            let mut should_deliver = link.success_rate.sample(self.context.as_mut());
-            let faults = link.faults;
-
-            // Determine if the message should be delivered to a different peer
+            // Deliver to a different peer if misdirected
             let mut destination = recipient;
-            if should_deliver && faults.misdirect_rate.sample(self.context.as_mut()) {
+            if should_deliver && delivery.misdirect {
                 match self.misdirect_target(channel, &origin, &destination) {
                     Some(target) => {
                         trace!(?origin, intended = ?destination, ?target, "misdirecting message");
@@ -959,14 +997,14 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
                 }
             }
 
-            // Determine if the message should be re-sent once the original arrives
-            if should_deliver && faults.duplicate_rate.sample(self.context.as_mut()) {
-                let path = self
-                    .links
-                    .get(&(origin.clone(), destination.clone()))
-                    .expect("destination must have a link");
-                let replay_latency =
-                    Duration::from_millis(path.sampler.sample(self.context.as_mut()) as u64);
+            // Flip a bit if corrupted
+            let message = match delivery.corrupt {
+                Some(bit) if should_deliver => flip(&message, bit),
+                _ => message.clone(),
+            };
+
+            // Re-send once the original arrives if duplicated
+            if let Some(replay_latency) = delivery.duplicate.filter(|_| should_deliver) {
                 let at = now
                     .checked_add(latency)
                     .expect("latency overflow computing replay time");
@@ -995,6 +1033,36 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
             );
             self.process_completions(completions);
         }
+    }
+
+    /// Sample a message's delivery from `link`'s latency, success rate, and [LinkFaults].
+    ///
+    /// Draws latency and success first, then (only for delivered messages and nonzero rates)
+    /// misdirection, corruption, and duplication, so a link without faults draws as before.
+    fn sample_delivery(context: &mut E, link: &Link, len: usize) -> NetworkDelivery {
+        let latency = Duration::from_millis(link.sampler.sample(context) as u64);
+        if !link.success_rate.sample(context) {
+            return NetworkDelivery {
+                after: latency,
+                ..NetworkDelivery::DROP
+            };
+        }
+        let faults = link.faults;
+        let mut delivery = NetworkDelivery::after(latency);
+        if faults.misdirect_rate.sample(context) {
+            delivery = delivery.misdirected();
+        }
+        if len > 0 && faults.corrupt_rate.sample(context) {
+            let bits = u64::try_from(len)
+                .expect("bounded message")
+                .saturating_mul(8);
+            delivery = delivery.corrupted(context.random_range(0..bits));
+        }
+        if faults.duplicate_rate.sample(context) {
+            let replay = Duration::from_millis(link.sampler.sample(context) as u64);
+            delivery = delivery.duplicated(replay);
+        }
+        delivery
     }
 
     fn queue_task(
@@ -1598,6 +1666,8 @@ struct Link {
     sampler: Normal<f64>,
     success_rate: Probability,
     faults: LinkFaults,
+    // Messages sent on the link, indexing each for a policy
+    sent: u64,
     // Messages with their receive time for ordered delivery
     inbox: mpsc::UnboundedSender<(Channel, IoBuf, SystemTime)>,
 }
@@ -1650,6 +1720,7 @@ impl Link {
             sampler,
             success_rate,
             faults: LinkFaults::NONE,
+            sent: 0,
             inbox,
         }
     }
