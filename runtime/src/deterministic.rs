@@ -3155,24 +3155,27 @@ mod tests {
 
     #[test]
     fn test_abort_stops_descendants_immediately() {
-        deterministic::Runner::default().start(|ctx| async move {
-            let ticks = Arc::new(AtomicUsize::new(0));
-            let child_ticks = ticks.clone();
-            let parent = ctx.child("parent").spawn(move |ctx| async move {
-                ctx.child("child").spawn(move |ctx| async move {
-                    loop {
-                        child_ticks.fetch_add(1, Ordering::SeqCst);
-                        ctx.sleep(Duration::from_millis(1)).await;
-                    }
+        // A descendant woken in the same tick as its ancestor's abort must not run, whatever
+        // order the runnable batch is polled in.
+        for seed in 0..64 {
+            deterministic::Runner::seeded(seed).start(|ctx| async move {
+                let ran = Arc::new(AtomicUsize::new(0));
+                let child_ran = ran.clone();
+                let (wake, woken) = oneshot::channel::<()>();
+                let parent = ctx.child("parent").spawn(move |ctx| async move {
+                    ctx.child("child").spawn(move |_| async move {
+                        let _ = woken.await;
+                        child_ran.fetch_add(1, Ordering::SeqCst);
+                    });
+                    futures::future::pending::<()>().await;
                 });
-                futures::future::pending::<()>().await;
+                ctx.sleep(Duration::from_millis(10)).await;
+                parent.abort();
+                let _ = wake.send(());
+                ctx.sleep(Duration::from_millis(10)).await;
+                assert_eq!(ran.load(Ordering::SeqCst), 0, "seed {seed}");
             });
-            ctx.sleep(Duration::from_millis(10)).await;
-            parent.abort();
-            let stopped = ticks.load(Ordering::SeqCst);
-            ctx.sleep(Duration::from_millis(10)).await;
-            assert_eq!(ticks.load(Ordering::SeqCst), stopped);
-        });
+        }
     }
 
     #[test]
