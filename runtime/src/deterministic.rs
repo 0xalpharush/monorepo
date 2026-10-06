@@ -101,14 +101,17 @@ use rand::{CryptoRng, Rng, SeedableRng, TryCryptoRng, TryRng, prelude::SliceRand
 use rayon::{ThreadPoolBuildError, ThreadPoolBuilder};
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap},
     convert::Infallible,
     mem::{replace, take},
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     task::{self, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -479,6 +482,8 @@ pub struct Executor {
     time: Mutex<SystemTime>,
     tasks: Arc<Tasks>,
     sleeping: Mutex<BinaryHeap<Alarm>>,
+    /// Woken tasks of paused processes, polled again once their process resumes.
+    parked: Mutex<Vec<u128>>,
     shutdown: Mutex<Stopper>,
     panicker: Panicker,
     dns: Mutex<HashMap<String, Vec<IpAddr>>>,
@@ -523,6 +528,17 @@ impl Executor {
             "scheduling policy changed the runnable batch"
         );
         *queue = ready.into_iter().map(|task| task.id).collect();
+    }
+
+    /// Requeue every parked task; those whose process is still paused park again.
+    fn unpark(&self) {
+        let parked = take(&mut *self.parked.lock());
+        let mut seen = BTreeSet::new();
+        for id in parked {
+            if seen.insert(id) {
+                self.tasks.queue(id);
+            }
+        }
     }
 
     /// Advance simulated time by [Config::cycle].
@@ -747,6 +763,13 @@ impl Runner {
                         continue;
                     };
 
+                    // Hold back the tasks of paused processes until they resume
+                    if task.process.as_ref().is_some_and(|process| process.paused()) {
+                        trace!(id, "parking task of paused process");
+                        executor.parked.lock().push(id);
+                        continue;
+                    }
+
                     // Record task for auditing
                     executor.auditor.event(b"process_task", |hasher| {
                         hasher.update(task.id.to_be_bytes());
@@ -910,6 +933,8 @@ enum Mode {
 struct Task {
     id: u128,
     label: Label,
+    /// The simulated process the task belongs to, if any.
+    process: Option<Arc<ProcessState>>,
 
     mode: Mode,
 }
@@ -969,6 +994,7 @@ impl Tasks {
         let task = Arc::new(Task {
             id,
             label: Label::root(),
+            process: None,
             mode: Mode::Root,
         });
         arc_self.register(id, task);
@@ -978,12 +1004,14 @@ impl Tasks {
     fn register_work(
         arc_self: &Arc<Self>,
         label: Label,
+        process: Option<Arc<ProcessState>>,
         future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     ) {
         let id = arc_self.increment();
         let task = Arc::new(Task {
             id,
             label,
+            process,
             mode: Mode::Work(Mutex::new(Some(future))),
         });
         arc_self.register(id, task);
@@ -1079,6 +1107,7 @@ pub struct Context {
     network_buffer_pool: BufferPool,
     storage_buffer_pool: BufferPool,
     tree: Arc<Tree>,
+    process: Option<Arc<ProcessState>>,
     execution: Execution,
 }
 
@@ -1145,6 +1174,7 @@ impl Context {
             time: Mutex::new(start_time),
             tasks: Arc::new(Tasks::new()),
             sleeping: Mutex::new(BinaryHeap::new()),
+            parked: Mutex::new(Vec::new()),
             shutdown: Mutex::new(Stopper::default()),
             panicker,
             dns: Mutex::new(HashMap::new()),
@@ -1162,6 +1192,7 @@ impl Context {
                 network_buffer_pool,
                 storage_buffer_pool,
                 tree: Tree::root(),
+                process: None,
                 execution: Execution::default(),
             },
             executor,
@@ -1231,6 +1262,7 @@ impl Context {
             metrics,
             tasks: Arc::new(Tasks::new()),
             sleeping: Mutex::new(BinaryHeap::new()),
+            parked: Mutex::new(Vec::new()),
             shutdown: Mutex::new(Stopper::default()),
             panicker,
         });
@@ -1246,6 +1278,7 @@ impl Context {
                 network_buffer_pool,
                 storage_buffer_pool,
                 tree: Tree::root(),
+                process: None,
                 execution: Execution::default(),
             },
             executor,
@@ -1256,6 +1289,11 @@ impl Context {
     /// Upgrade Weak reference to [Executor].
     fn executor(&self) -> Arc<Executor> {
         self.executor.upgrade().expect("executor already dropped")
+    }
+
+    /// Signed offset of this context's clock from the runtime's, in nanoseconds.
+    fn clock_offset(&self) -> i128 {
+        self.process.as_ref().map_or(0, |process| process.offset())
     }
 
     /// Get a reference to [Metrics].
@@ -1296,7 +1334,7 @@ impl Context {
     /// Start a simulated process that owns every partition `partitions` selects.
     ///
     /// Returns the process's context, from which its tasks are spawned, and a [Process] that
-    /// crashes it. Peers started from other contexts keep running when it crashes, so one
+    /// crashes, pauses, or skews the clock of it. Peers started from other contexts keep running when it crashes, so one
     /// process can crash and restart (by opening its partitions again from a new process) while
     /// the rest of the simulation continues.
     pub fn process(
@@ -1304,8 +1342,15 @@ impl Context {
         label: &'static str,
         partitions: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) -> (Self, Process) {
-        let context = crate::Supervisor::child(self, label);
+        let mut context = crate::Supervisor::child(self, label);
+        let state = Arc::new(ProcessState {
+            parent: context.process.take(),
+            paused: AtomicBool::new(false),
+            offset: Mutex::new(0),
+        });
+        context.process = Some(Arc::clone(&state));
         let process = Process {
+            state,
             tree: Arc::clone(&context.tree),
             executor: context.executor.clone(),
             storage: context.storage.clone(),
@@ -1372,6 +1417,7 @@ impl crate::Spawner for Context {
         // Spawn the task (we don't care about Model)
         let guard = FactoryGuard::new(&parent, metric);
         let executor = self.executor();
+        let process = self.process.clone();
         let future = f(self);
         let (f, handle) = Handle::init(
             future,
@@ -1379,7 +1425,7 @@ impl crate::Spawner for Context {
             executor.panicker.clone(),
             Arc::clone(&parent),
         );
-        Tasks::register_work(&executor.tasks, label, Box::pin(f));
+        Tasks::register_work(&executor.tasks, label, process, Box::pin(f));
 
         handle
     }
@@ -1462,6 +1508,7 @@ impl crate::Strategizer for Context {
 /// The process's tasks are those spawned from its context (and their descendants). Its storage
 /// is the set of partitions it was started with.
 pub struct Process {
+    state: Arc<ProcessState>,
     tree: Arc<Tree>,
     executor: Weak<Executor>,
     storage: Arc<Storage>,
@@ -1478,17 +1525,111 @@ impl Process {
     /// storage fault configuration and policy), and blobs opened before the crash stop publishing.
     pub fn crash(self) {
         self.tree.abort();
-        self.executor
-            .upgrade()
-            .expect("executor already dropped")
-            .auditor
-            .event(b"crash_process", |_| {});
+        let executor = self.executor();
+        executor.auditor.event(b"crash_process", |_| {});
+
+        // Aborted tasks parked by a pause are dropped once polled
+        self.state.paused.store(false, AtomicOrdering::Relaxed);
+        executor.unpark();
         self.storage
             .inner()
             .inner()
             .crash_partitions(&self.partitions)
             .expect("retaining successful unsynced writes at crash should succeed");
     }
+
+    /// Pause the process, as `SIGSTOP` would.
+    ///
+    /// None of its tasks (nor those of processes started from its context) is polled until
+    /// [Self::resume]. Time keeps advancing for everything else: its timers expire and messages
+    /// sent to it are buffered, and it observes all of that at once when it resumes.
+    pub fn pause(&self) {
+        self.executor().auditor.event(b"pause_process", |_| {});
+        self.state.paused.store(true, AtomicOrdering::Relaxed);
+    }
+
+    /// Resume a paused process, as `SIGCONT` would.
+    pub fn resume(&self) {
+        let executor = self.executor();
+        executor.auditor.event(b"resume_process", |_| {});
+        self.state.paused.store(false, AtomicOrdering::Relaxed);
+        executor.unpark();
+    }
+
+    /// Set how far the process's clock is from the runtime's, replacing any previous offset.
+    ///
+    /// The offset shifts what [Clock::current] returns and the deadlines passed to
+    /// [Clock::sleep_until] in the process (and in processes started from its context), so
+    /// setting it jumps the process's clock and setting it repeatedly strobes it. Durations
+    /// (as in [Clock::sleep]) and other processes are unaffected.
+    pub fn set_clock_offset(&self, offset: ClockOffset) {
+        let nanos = offset.nanos();
+        self.executor().auditor.event(b"clock_offset", |hasher| {
+            hasher.update(nanos.to_be_bytes());
+        });
+        *self.state.offset.lock() = nanos;
+    }
+
+    fn executor(&self) -> Arc<Executor> {
+        self.executor.upgrade().expect("executor already dropped")
+    }
+}
+
+/// How far a [Process]'s clock is from the runtime's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockOffset {
+    /// The process's clock reads later than the runtime's by this much.
+    Ahead(Duration),
+    /// The process's clock reads earlier than the runtime's by this much.
+    Behind(Duration),
+}
+
+impl ClockOffset {
+    fn nanos(self) -> i128 {
+        let (duration, sign) = match self {
+            Self::Ahead(duration) => (duration, 1),
+            Self::Behind(duration) => (duration, -1),
+        };
+        i128::try_from(duration.as_nanos()).expect("clock offset overflow") * sign
+    }
+}
+
+/// Pause and clock state shared by the contexts of a [Process].
+struct ProcessState {
+    /// The process whose context this process was started from, if any.
+    parent: Option<Arc<Self>>,
+    paused: AtomicBool,
+    /// Signed offset of this process's clock from its parent's, in nanoseconds.
+    offset: Mutex<i128>,
+}
+
+impl ProcessState {
+    /// Whether this process or any process it was started from is paused.
+    fn paused(&self) -> bool {
+        self.paused.load(AtomicOrdering::Relaxed)
+            || self.parent.as_ref().is_some_and(|parent| parent.paused())
+    }
+
+    /// Signed offset of this process's clock from the runtime's, in nanoseconds.
+    fn offset(&self) -> i128 {
+        let parent = self.parent.as_ref().map_or(0, |parent| parent.offset());
+        parent
+            .checked_add(*self.offset.lock())
+            .expect("clock offset overflow")
+    }
+}
+
+/// Shifts `time` by a signed number of nanoseconds.
+fn shift(time: SystemTime, nanos: i128) -> SystemTime {
+    let magnitude = Duration::from_nanos(
+        u64::try_from(nanos.unsigned_abs()).expect("clock offset overflow"),
+    );
+    if nanos >= 0 {
+        time.checked_add(magnitude)
+    } else {
+        time.checked_sub(magnitude)
+    }
+    .expect("clock offset moved time out of range")
 }
 
 impl crate::Supervisor for Context {
@@ -1504,6 +1645,7 @@ impl crate::Supervisor for Context {
             network_buffer_pool: self.network_buffer_pool.clone(),
             storage_buffer_pool: self.storage_buffer_pool.clone(),
             tree,
+            process: self.process.clone(),
             execution: Execution::default(),
         }
     }
@@ -1626,7 +1768,7 @@ impl Future for Sleeper {
 
 impl Clock for Context {
     fn current(&self) -> SystemTime {
-        *self.executor().time.lock()
+        shift(*self.executor().time.lock(), self.clock_offset())
     }
 
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send + 'static + use<> {
@@ -1644,7 +1786,7 @@ impl Clock for Context {
         Sleeper {
             executor: self.executor.clone(),
 
-            time: deadline,
+            time: shift(deadline, -self.clock_offset()),
             waker: None,
         }
     }
@@ -1904,7 +2046,11 @@ mod tests {
     use commonware_parallel::Strategy;
     #[cfg(feature = "external")]
     use commonware_utils::channel::mpsc;
-    use commonware_utils::{NZUsize, ScriptedRng, channel::oneshot, probability};
+    use commonware_utils::{
+        NZUsize, ScriptedRng,
+        channel::{mpsc, oneshot},
+        probability,
+    };
     #[cfg(feature = "external")]
     use futures::StreamExt;
     #[cfg(not(feature = "external"))]
@@ -3280,6 +3426,161 @@ mod tests {
                 ("healthy", Some(&b"blob"[..]), FaultDraw::Fail)
             ]
         );
+    }
+
+    /// Spawns a task in `ctx` that counts every millisecond tick it observes.
+    fn ticker(ctx: Context) -> Arc<AtomicUsize> {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = ticks.clone();
+        ctx.spawn(move |ctx| async move {
+            loop {
+                counter.fetch_add(1, Ordering::SeqCst);
+                ctx.sleep(Duration::from_millis(1)).await;
+            }
+        });
+        ticks
+    }
+
+    #[test]
+    fn test_process_pause_holds_tasks_until_resume() {
+        for seed in 0..32 {
+            deterministic::Runner::seeded(seed).start(|ctx| async move {
+                let (process_ctx, process) = ctx.process("node", |_| false);
+                let ticks = ticker(process_ctx.child("ticker"));
+                let (sender, mut receiver) = mpsc::unbounded_channel::<u64>();
+                let received = Arc::new(Mutex::new(Vec::new()));
+                let log = received.clone();
+                process_ctx.child("receiver").spawn(move |ctx| async move {
+                    while let Some(sent) = receiver.recv().await {
+                        log.lock().push((sent, ctx.current()));
+                    }
+                });
+                let peer_ticks = ticker(ctx.child("peer"));
+                ctx.sleep(Duration::from_millis(10)).await;
+
+                process.pause();
+                let paused_at = ctx.current();
+                let frozen = ticks.load(Ordering::SeqCst);
+                let peer_before = peer_ticks.load(Ordering::SeqCst);
+                sender.send(1).unwrap();
+                ctx.sleep(Duration::from_millis(50)).await;
+                assert_eq!(ticks.load(Ordering::SeqCst), frozen, "paused tasks ran");
+                assert!(received.lock().is_empty(), "paused task received a message");
+                assert!(peer_ticks.load(Ordering::SeqCst) >= peer_before + 45, "peer stalled");
+
+                process.resume();
+                ctx.sleep(Duration::from_millis(5)).await;
+                // The buffered message and the overdue timer are both observed after resuming.
+                let received = received.lock().clone();
+                assert_eq!(received.len(), 1);
+                assert!(received[0].1 >= paused_at + Duration::from_millis(50));
+                ctx.sleep(Duration::from_millis(10)).await;
+                assert!(ticks.load(Ordering::SeqCst) > frozen + 5, "resumed tasks did not run");
+            });
+        }
+    }
+
+    #[test]
+    fn test_process_pause_covers_nested_processes() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let (outer_ctx, outer) = ctx.process("host", |_| false);
+            let (inner_ctx, _inner) = outer_ctx.process("node", |_| false);
+            let ticks = ticker(inner_ctx);
+            ctx.sleep(Duration::from_millis(5)).await;
+            outer.pause();
+            let frozen = ticks.load(Ordering::SeqCst);
+            ctx.sleep(Duration::from_millis(20)).await;
+            assert_eq!(ticks.load(Ordering::SeqCst), frozen);
+            outer.resume();
+            ctx.sleep(Duration::from_millis(5)).await;
+            assert!(ticks.load(Ordering::SeqCst) > frozen);
+        });
+    }
+
+    #[test]
+    fn test_process_crash_while_paused_drops_tasks() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let (process_ctx, process) = ctx.process("node", |_| false);
+            let ticks = ticker(process_ctx);
+            ctx.sleep(Duration::from_millis(5)).await;
+            process.pause();
+            let frozen = ticks.load(Ordering::SeqCst);
+            ctx.sleep(Duration::from_millis(5)).await;
+            process.crash();
+            ctx.sleep(Duration::from_millis(20)).await;
+            assert_eq!(ticks.load(Ordering::SeqCst), frozen, "crashed task ran");
+            // The crashed task was dropped rather than left parked.
+            assert_eq!(Arc::strong_count(&ticks), 1);
+        });
+    }
+
+    #[test]
+    fn test_process_clock_offset() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let (process_ctx, process) = ctx.process("node", |_| false);
+            let start = ctx.current();
+            assert_eq!(process_ctx.current(), start);
+
+            // Jump ahead: only the process's clock moves.
+            process.set_clock_offset(ClockOffset::Ahead(Duration::from_secs(100)));
+            assert_eq!(process_ctx.current(), start + Duration::from_secs(100));
+            assert_eq!(ctx.current(), start);
+            let child = process_ctx.child("child");
+            assert_eq!(child.current(), start + Duration::from_secs(100));
+
+            // A deadline on the process's clock fires when its clock reaches it.
+            let deadline = process_ctx.current() + Duration::from_millis(10);
+            process_ctx.sleep_until(deadline).await;
+            assert_eq!(process_ctx.current(), deadline);
+            assert_eq!(ctx.current(), start + Duration::from_millis(10));
+
+            // Durations are unaffected by the offset.
+            let before = ctx.current();
+            process_ctx.sleep(Duration::from_millis(10)).await;
+            assert_eq!(ctx.current(), before + Duration::from_millis(10));
+
+            // Jump behind: the process observes its clock going backwards.
+            let ahead = process_ctx.current();
+            process.set_clock_offset(ClockOffset::Behind(Duration::from_secs(5)));
+            assert!(process_ctx.current() < ahead);
+            assert_eq!(process_ctx.current(), ctx.current() - Duration::from_secs(5));
+
+            // Nested processes add their offsets.
+            let (inner_ctx, inner) = process_ctx.process("inner", |_| false);
+            inner.set_clock_offset(ClockOffset::Ahead(Duration::from_secs(2)));
+            assert_eq!(inner_ctx.current(), ctx.current() - Duration::from_secs(3));
+        });
+    }
+
+    #[test]
+    fn test_process_faults_are_deterministic() {
+        let run = |seed| {
+            deterministic::Runner::seeded(seed).start(|ctx| async move {
+                let (process_ctx, process) = ctx.process("node", |_| false);
+                let ticks = ticker(process_ctx.child("ticker"));
+                let peer = ticker(ctx.child("peer"));
+                for round in 0..10u64 {
+                    ctx.sleep(Duration::from_millis(3)).await;
+                    if round % 2 == 0 {
+                        process.pause();
+                    } else {
+                        process.resume();
+                    }
+                    let offset = Duration::from_millis(round * 7);
+                    process.set_clock_offset(if round % 3 == 0 {
+                        ClockOffset::Behind(offset)
+                    } else {
+                        ClockOffset::Ahead(offset)
+                    });
+                }
+                (
+                    ticks.load(Ordering::SeqCst),
+                    peer.load(Ordering::SeqCst),
+                    ctx.auditor().state(),
+                )
+            })
+        };
+        assert_eq!(run(7), run(7));
     }
 
     #[test]
