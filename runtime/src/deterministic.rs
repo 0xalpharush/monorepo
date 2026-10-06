@@ -1293,23 +1293,25 @@ impl Context {
         self.storage.inner().inner().config()
     }
 
-    /// Crash the storage of every partition `affected` selects while the runtime keeps running.
+    /// Start a simulated process that owns every partition `partitions` selects.
     ///
-    /// Each affected partition's unsynchronized mutations are resolved as a crash at this point
-    /// would resolve them (per the fault policy's retention decisions), and every handle opened
-    /// before the crash stops publishing. Reopening an affected blob observes only its surviving
-    /// contents. Other partitions, tasks, and the network are untouched, so one simulated process
-    /// can crash and restart while its peers keep running.
-    ///
-    /// The caller must first stop every task that uses an affected partition (for example by
-    /// aborting the task whose supervision subtree owns them).
-    pub fn crash_storage(&self, affected: impl Fn(&str) -> bool) {
-        self.executor().auditor.event(b"crash_storage", |_| {});
-        self.storage
-            .inner()
-            .inner()
-            .crash_partitions(affected)
-            .expect("retaining successful unsynced writes at crash should succeed");
+    /// Returns the process's context, from which its tasks are spawned, and a [Process] that
+    /// crashes it. Peers started from other contexts keep running when it crashes, so one
+    /// process can crash and restart (by opening its partitions again from a new process) while
+    /// the rest of the simulation continues.
+    pub fn process(
+        &self,
+        label: &'static str,
+        partitions: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> (Self, Process) {
+        let context = crate::Supervisor::child(self, label);
+        let process = Process {
+            tree: Arc::clone(&context.tree),
+            executor: context.executor.clone(),
+            storage: context.storage.clone(),
+            partitions: Box::new(partitions),
+        };
+        (context, process)
     }
 
     /// Register a DNS mapping for a hostname.
@@ -1452,6 +1454,40 @@ impl crate::Strategizer for Context {
             shared_thread_pool().expect("failed to create deterministic Rayon thread pool"),
         )
         .with_parallelism(parallelism)
+    }
+}
+
+/// A simulated process started by [Context::process].
+///
+/// The process's tasks are those spawned from its context (and their descendants). Its storage
+/// is the set of partitions it was started with.
+pub struct Process {
+    tree: Arc<Tree>,
+    executor: Weak<Executor>,
+    storage: Arc<Storage>,
+    partitions: Box<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
+impl Process {
+    /// Crash the process, as a power loss on its host would.
+    ///
+    /// Every task of the process is aborted before this returns, so none of them runs again
+    /// (unlike [Handle::abort], which aborts descendants once the aborted task is next polled).
+    /// Its listeners and connections close as their tasks are dropped. Then each owned
+    /// partition's unsynchronized writes are resolved as a crash would resolve them (per the
+    /// storage fault configuration and policy), and blobs opened before the crash stop publishing.
+    pub fn crash(self) {
+        self.tree.abort();
+        self.executor
+            .upgrade()
+            .expect("executor already dropped")
+            .auditor
+            .event(b"crash_process", |_| {});
+        self.storage
+            .inner()
+            .inner()
+            .crash_partitions(&self.partitions)
+            .expect("retaining successful unsynced writes at crash should succeed");
     }
 }
 
@@ -3154,15 +3190,16 @@ mod tests {
     }
 
     #[test]
-    fn test_abort_stops_descendants_immediately() {
-        // A descendant woken in the same tick as its ancestor's abort must not run, whatever
-        // order the runnable batch is polled in.
+    fn test_process_crash_stops_tasks_immediately() {
+        // A task woken in the same tick as its process's crash must not run, whatever order the
+        // runnable batch is polled in.
         for seed in 0..64 {
             deterministic::Runner::seeded(seed).start(|ctx| async move {
                 let ran = Arc::new(AtomicUsize::new(0));
                 let child_ran = ran.clone();
                 let (wake, woken) = oneshot::channel::<()>();
-                let parent = ctx.child("parent").spawn(move |ctx| async move {
+                let (process_ctx, process) = ctx.process("node", |_| false);
+                process_ctx.spawn(move |ctx| async move {
                     ctx.child("child").spawn(move |_| async move {
                         let _ = woken.await;
                         child_ran.fetch_add(1, Ordering::SeqCst);
@@ -3170,7 +3207,7 @@ mod tests {
                     futures::future::pending::<()>().await;
                 });
                 ctx.sleep(Duration::from_millis(10)).await;
-                parent.abort();
+                process.crash();
                 let _ = wake.send(());
                 ctx.sleep(Duration::from_millis(10)).await;
                 assert_eq!(ran.load(Ordering::SeqCst), 0, "seed {seed}");
@@ -3246,8 +3283,9 @@ mod tests {
     }
 
     #[test]
-    fn test_crash_storage_crashes_only_selected_partitions() {
+    fn test_process_crash_crashes_only_its_partitions() {
         deterministic::Runner::default().start(|ctx| async move {
+            let (_, process) = ctx.process("node0", |partition| partition == "node0");
             for partition in ["node0", "node1"] {
                 let (blob, _) = ctx.open(partition, b"blob").await.unwrap();
                 blob.write_at(0, b"durable".to_vec(), WriteOptions::default())
@@ -3264,7 +3302,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            ctx.crash_storage(|partition| partition == "node0");
+            process.crash();
 
             // The crashed partition keeps only its synced bytes.
             let (blob, len) = ctx.open("node0", b"blob").await.unwrap();
