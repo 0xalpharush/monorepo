@@ -5,7 +5,8 @@
 //! quality. Messages on a link are delivered in order, and optional per-peer bandwidth limits account for
 //! transmission delay and queueing.
 //!
-//! Links can also duplicate or misdirect messages (see [LinkFaults] and [Oracle::set_link_faults]).
+//! Links can also duplicate or corrupt messages (see [LinkFaults] and [Oracle::set_link_faults]),
+//! or a policy can decide every message (see [Oracle::set_policy]).
 //!
 //! # Determinism
 //!
@@ -3599,7 +3600,6 @@ mod tests {
     fn test_link_faults_determinism() {
         let faults = LinkFaults {
             duplicate_rate: probability!(0.5),
-            misdirect_rate: probability!(0.25),
             corrupt_rate: probability!(0.25),
         };
         let mut outputs = Vec::new();
@@ -3696,8 +3696,7 @@ mod tests {
         });
     }
 
-    /// Drops a link's first message, corrupts its second, duplicates its third, and misdirects
-    /// its fourth.
+    /// Drops a link's first message, corrupts its second, and duplicates its third.
     struct ScriptedMessages;
 
     impl commonware_runtime::deterministic::NetworkPolicy<ed25519::PublicKey> for ScriptedMessages {
@@ -3715,7 +3714,6 @@ mod tests {
                 0 => NetworkDelivery::DROP,
                 1 => NetworkDelivery::after(after).corrupted(0),
                 2 => NetworkDelivery::after(after).duplicated(after),
-                3 => NetworkDelivery::after(after).misdirected(),
                 _ => NetworkDelivery::after(after),
             }
         }
@@ -3751,7 +3749,7 @@ mod tests {
                     (1, IoBuf::from(b"l1")),
                     (1, IoBuf::from(b"m2")),
                     (1, IoBuf::from(b"m2")),
-                    (2, IoBuf::from(b"m3")),
+                    (1, IoBuf::from(b"m3")),
                     (1, IoBuf::from(b"m4")),
                 ]
             );
@@ -3791,145 +3789,6 @@ mod tests {
             let deliveries = drain(&mut log);
             assert_eq!(deliveries.len(), 1);
             assert_eq!(deliveries[0].2, IoBuf::from(b"only"));
-        });
-    }
-
-    #[test]
-    fn test_link_faults_misdirect_all() {
-        let executor = deterministic::Runner::default();
-        executor.start(|context| async move {
-            let (oracle, keys, mut senders, mut log) = start_logged_network(&context, 5).await;
-
-            // This peer only registers another channel, so it is never a target on channel 0
-            let other = PrivateKey::from_seed(100).public_key();
-            let (_, _other_receiver) = oracle
-                .control(other.clone())
-                .register(1, TEST_QUOTA)
-                .await
-                .unwrap();
-            let mut tracked = keys.clone();
-            tracked.push(other.clone());
-            let mut manager = oracle.manager();
-            manager.track(1, Set::from_iter_dedup(tracked));
-            assert!(manager.peer_set(1).await.is_some());
-
-            // Peer 3 has no link from peer 0, so it is never a target
-            for to in [1, 2, 4] {
-                oracle
-                    .add_link(keys[0].clone(), keys[to].clone(), FAULT_LINK)
-                    .await
-                    .unwrap();
-            }
-            oracle
-                .add_link(keys[0].clone(), other.clone(), FAULT_LINK)
-                .await
-                .unwrap();
-
-            // Peer 4 is blocked by peer 0, so it is never a target
-            crate::block_peer(&mut oracle.control(keys[0].clone()), keys[4].clone());
-            oracle
-                .set_link_faults(
-                    keys[0].clone(),
-                    keys[1].clone(),
-                    LinkFaults {
-                        misdirect_rate: probability!(1.0),
-                        ..LinkFaults::NONE
-                    },
-                )
-                .await
-                .unwrap();
-
-            for n in 0..20u32 {
-                senders[0].send(
-                    Recipients::One(keys[1].clone()),
-                    n.to_be_bytes().to_vec(),
-                    false,
-                );
-            }
-            context.sleep(Duration::from_secs(1)).await;
-
-            // Only peer 2 is eligible, and it observes peer 0 as the sender
-            let deliveries = drain(&mut log);
-            assert_eq!(deliveries.len(), 20);
-            for (n, (to, from, message, _)) in deliveries.into_iter().enumerate() {
-                assert_eq!(to, 2);
-                assert_eq!(from, keys[0]);
-                assert_eq!(message, IoBuf::from((n as u32).to_be_bytes().to_vec()));
-            }
-        });
-    }
-
-    #[test]
-    fn test_link_faults_misdirect_spreads_across_targets() {
-        let executor = deterministic::Runner::default();
-        executor.start(|context| async move {
-            let (oracle, keys, mut senders, mut log) = start_logged_network(&context, 4).await;
-            for to in 1..4 {
-                oracle
-                    .add_link(keys[0].clone(), keys[to].clone(), FAULT_LINK)
-                    .await
-                    .unwrap();
-            }
-            oracle
-                .set_link_faults(
-                    keys[0].clone(),
-                    keys[1].clone(),
-                    LinkFaults {
-                        misdirect_rate: probability!(1.0),
-                        ..LinkFaults::NONE
-                    },
-                )
-                .await
-                .unwrap();
-
-            for n in 0..50u32 {
-                senders[0].send(
-                    Recipients::One(keys[1].clone()),
-                    n.to_be_bytes().to_vec(),
-                    false,
-                );
-            }
-            context.sleep(Duration::from_secs(1)).await;
-
-            let deliveries = drain(&mut log);
-            assert_eq!(deliveries.len(), 50);
-            let mut counts = [0usize; 4];
-            for (to, from, _, _) in deliveries {
-                assert_eq!(from, keys[0]);
-                counts[to] += 1;
-            }
-            assert_eq!(counts[0], 0);
-            assert_eq!(counts[1], 0);
-            assert!(counts[2] > 0);
-            assert!(counts[3] > 0);
-        });
-    }
-
-    #[test]
-    fn test_link_faults_misdirect_without_target_drops() {
-        let executor = deterministic::Runner::default();
-        executor.start(|context| async move {
-            let (oracle, keys, mut senders, mut log) = start_logged_network(&context, 2).await;
-            oracle
-                .add_link(keys[0].clone(), keys[1].clone(), FAULT_LINK)
-                .await
-                .unwrap();
-            oracle
-                .set_link_faults(
-                    keys[0].clone(),
-                    keys[1].clone(),
-                    LinkFaults {
-                        duplicate_rate: probability!(1.0),
-                        misdirect_rate: probability!(1.0),
-                        ..LinkFaults::NONE
-                    },
-                )
-                .await
-                .unwrap();
-
-            senders[0].send(Recipients::One(keys[1].clone()), b"lost".to_vec(), false);
-            context.sleep(Duration::from_secs(1)).await;
-            assert!(drain(&mut log).is_empty());
         });
     }
 
