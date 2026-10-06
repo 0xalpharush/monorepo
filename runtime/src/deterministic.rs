@@ -53,7 +53,7 @@ use crate::{
     prefixed_name,
     storage::{
         audited::{Blob as AuditedBlob, Storage as AuditedStorage},
-        faulty::{Blob as FaultyBlob, Storage as FaultyStorage},
+        faulty::{Blob as FaultyBlob, Crasher, Storage as FaultyStorage},
         memory::{
             Blob as MemBlob, Snapshot as MemStorageSnapshot, Storage as MemStorage,
             open::{Blob as OpenBlob, Opens},
@@ -516,6 +516,8 @@ pub struct Executor {
     sleeping: Mutex<BinaryHeap<Alarm>>,
     /// Woken tasks of paused processes, polled again once their process resumes.
     parked: Mutex<Vec<u128>>,
+    /// Live simulated processes, in start order.
+    processes: Mutex<Vec<Arc<ProcessHost>>>,
     shutdown: Mutex<Stopper>,
     panicker: Panicker,
     dns: Mutex<HashMap<String, Vec<IpAddr>>>,
@@ -560,6 +562,20 @@ impl Executor {
             "scheduling policy changed the runnable batch"
         );
         *queue = ready.into_iter().map(|task| task.id).collect();
+    }
+
+    /// Crash `host` unless it already crashed.
+    fn crash_process(&self, host: &Arc<ProcessHost>) {
+        let live = {
+            let mut processes = self.processes.lock();
+            processes
+                .iter()
+                .position(|process| Arc::ptr_eq(process, host))
+                .map(|index| processes.remove(index))
+        };
+        if live.is_some() {
+            host.crash(self);
+        }
     }
 
     /// Requeue every parked task; those whose process is still paused park again.
@@ -892,6 +908,10 @@ impl Runner {
         // root future is still Pending and holds captured variables with Context references.
         drop(root);
 
+        // Release simulated processes and the storage's way back to the executor.
+        storage.inner().inner().crasher().lock().take();
+        executor.processes.lock().clear();
+
         // No task can issue or make a write durable after this crash boundary.
         storage
             .inner()
@@ -1211,11 +1231,13 @@ impl Context {
             tasks: Arc::new(Tasks::new()),
             sleeping: Mutex::new(BinaryHeap::new()),
             parked: Mutex::new(Vec::new()),
+            processes: Mutex::new(Vec::new()),
             shutdown: Mutex::new(Stopper::default()),
             panicker,
             dns: Mutex::new(HashMap::new()),
         });
         install_timer(&timer, &executor);
+        install_crasher(&storage, &executor);
 
         (
             Self {
@@ -1299,10 +1321,12 @@ impl Context {
             tasks: Arc::new(Tasks::new()),
             sleeping: Mutex::new(BinaryHeap::new()),
             parked: Mutex::new(Vec::new()),
+            processes: Mutex::new(Vec::new()),
             shutdown: Mutex::new(Stopper::default()),
             panicker,
         });
         install_timer(&timer, &executor);
+        install_crasher(&storage, &executor);
         (
             Self {
                 name: String::new(),
@@ -1545,9 +1569,11 @@ impl Context {
     /// Start a simulated process that owns every partition `partitions` selects.
     ///
     /// Returns the process's context, from which its tasks are spawned, and a [Process] that
-    /// crashes, pauses, or skews the clock of it. Peers started from other contexts keep running when it crashes, so one
-    /// process can crash and restart (by opening its partitions again from a new process) while
-    /// the rest of the simulation continues.
+    /// crashes, pauses, or skews the clock of it. Peers started from other contexts keep running
+    /// when it crashes, so one process can crash and restart (by opening its partitions again
+    /// from a new process) while the rest of the simulation continues. With
+    /// [FaultConfig::crash], a write or sync of an owned partition can also crash the process
+    /// from within that operation (the latest started live process owning a partition crashes).
     pub fn process(
         &self,
         label: &'static str,
@@ -1560,12 +1586,17 @@ impl Context {
             offset: Mutex::new(0),
         });
         context.process = Some(Arc::clone(&state));
-        let process = Process {
+        let host = Arc::new(ProcessHost {
             state,
             tree: Arc::clone(&context.tree),
-            executor: context.executor.clone(),
             storage: context.storage.clone(),
             partitions: Box::new(partitions),
+            crashed: AtomicBool::new(false),
+        });
+        self.executor().processes.lock().push(Arc::clone(&host));
+        let process = Process {
+            host,
+            executor: context.executor.clone(),
         };
         (context, process)
     }
@@ -1719,24 +1750,23 @@ impl crate::Strategizer for Context {
 /// The process's tasks are those spawned from its context (and their descendants). Its storage
 /// is the set of partitions it was started with.
 pub struct Process {
-    state: Arc<ProcessState>,
-    tree: Arc<Tree>,
+    host: Arc<ProcessHost>,
     executor: Weak<Executor>,
-    storage: Arc<Storage>,
-    partitions: Box<dyn Fn(&str) -> bool + Send + Sync>,
 }
 
-impl Process {
-    /// Crash the process, as a power loss on its host would.
-    ///
-    /// Every task of the process is aborted before this returns, so none of them runs again
-    /// (unlike [Handle::abort], which aborts descendants once the aborted task is next polled).
-    /// Its listeners and connections close as their tasks are dropped. Then each owned
-    /// partition's unsynchronized writes are resolved as a crash would resolve them (per the
-    /// storage fault configuration and policy), and blobs opened before the crash stop publishing.
-    pub fn crash(self) {
+/// The tasks and storage of a [Process].
+struct ProcessHost {
+    state: Arc<ProcessState>,
+    tree: Arc<Tree>,
+    storage: Arc<Storage>,
+    partitions: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    crashed: AtomicBool,
+}
+
+impl ProcessHost {
+    fn crash(&self, executor: &Executor) {
         self.tree.abort();
-        let executor = self.executor();
+        self.crashed.store(true, AtomicOrdering::Relaxed);
         executor.auditor.event(b"crash_process", |_| {});
 
         // Aborted tasks parked by a pause are dropped once polled
@@ -1748,6 +1778,27 @@ impl Process {
             .crash_partitions(&self.partitions)
             .expect("retaining successful unsynced writes at crash should succeed");
     }
+}
+
+impl Process {
+    /// Crash the process, as a power loss on its host would.
+    ///
+    /// Every task of the process is aborted before this returns, so none of them runs again
+    /// (unlike [Handle::abort], which aborts descendants once the aborted task is next polled).
+    /// Its listeners and connections close as their tasks are dropped. Then each owned
+    /// partition's unsynchronized writes are resolved as a crash would resolve them (per the
+    /// storage fault configuration and policy), and blobs opened before the crash stop publishing.
+    ///
+    /// Does nothing if the process already crashed (see [Self::crashed]).
+    pub fn crash(self) {
+        self.executor().crash_process(&self.host);
+    }
+
+    /// Whether the process has crashed, either through [Self::crash] or from within one of its
+    /// storage operations (see [FaultConfig::crash]).
+    pub fn crashed(&self) -> bool {
+        self.host.crashed.load(AtomicOrdering::Relaxed)
+    }
 
     /// Pause the process, as `SIGSTOP` would.
     ///
@@ -1756,14 +1807,14 @@ impl Process {
     /// sent to it are buffered, and it observes all of that at once when it resumes.
     pub fn pause(&self) {
         self.executor().auditor.event(b"pause_process", |_| {});
-        self.state.paused.store(true, AtomicOrdering::Relaxed);
+        self.host.state.paused.store(true, AtomicOrdering::Relaxed);
     }
 
     /// Resume a paused process, as `SIGCONT` would.
     pub fn resume(&self) {
         let executor = self.executor();
         executor.auditor.event(b"resume_process", |_| {});
-        self.state.paused.store(false, AtomicOrdering::Relaxed);
+        self.host.state.paused.store(false, AtomicOrdering::Relaxed);
         executor.unpark();
     }
 
@@ -1778,7 +1829,7 @@ impl Process {
         self.executor().auditor.event(b"clock_offset", |hasher| {
             hasher.update(nanos.to_be_bytes());
         });
-        *self.state.offset.lock() = nanos;
+        *self.host.state.offset.lock() = nanos;
     }
 
     fn executor(&self) -> Arc<Executor> {
@@ -2020,6 +2071,51 @@ impl Timer for ExecutorTimer {
             waker: None,
         })
     }
+}
+
+/// Crashes the processes that own partitions from within their storage operations. Holds only a
+/// weak reference, so storage never keeps its executor alive.
+struct ExecutorCrasher(Weak<Executor>);
+
+impl ExecutorCrasher {
+    /// The latest started live process that owns `partition`.
+    fn owner(&self, partition: &str) -> Option<(Arc<Executor>, Arc<ProcessHost>)> {
+        let executor = self.0.upgrade()?;
+        let owner = executor
+            .processes
+            .lock()
+            .iter()
+            .rev()
+            .find(|host| (host.partitions)(partition))
+            .cloned()?;
+        Some((executor, owner))
+    }
+}
+
+impl Crasher for ExecutorCrasher {
+    fn owns(&self, partition: &str) -> bool {
+        self.owner(partition).is_some()
+    }
+
+    fn crash(&self, partition: &str) {
+        let (executor, owner) = self
+            .owner(partition)
+            .expect("crashed partition has no owner");
+        executor.auditor.event(b"crash_in_storage", |hasher| {
+            hasher.update(partition.as_bytes());
+        });
+        executor.crash_process(&owner);
+    }
+}
+
+fn install_crasher(storage: &Storage, executor: &Arc<Executor>) {
+    let previous = storage
+        .inner()
+        .inner()
+        .crasher()
+        .lock()
+        .replace(Arc::new(ExecutorCrasher(Arc::downgrade(executor))));
+    assert!(previous.is_none(), "storage crasher installed twice");
 }
 
 fn install_timer(slot: &TimerSlot, executor: &Arc<Executor>) {
@@ -3815,6 +3911,170 @@ mod tests {
             })
         };
         assert_eq!(run(7), run(7));
+    }
+
+    /// Crashes the `crash_at`-th crash decision (counting from zero) and keeps the first `keep`
+    /// bytes of every write a crash resolves.
+    struct CrashAt {
+        crash_at: usize,
+        keep: usize,
+        crashes: Mutex<usize>,
+    }
+
+    impl CrashAt {
+        fn new(crash_at: usize, keep: usize) -> Arc<Self> {
+            Arc::new(Self {
+                crash_at,
+                keep,
+                crashes: Mutex::new(0),
+            })
+        }
+    }
+
+    impl FaultPolicy for CrashAt {
+        fn occurs(&self, decision: &FaultDecision<'_>, _: commonware_utils::Probability) -> bool {
+            match decision.draw {
+                FaultDraw::Crash => {
+                    let mut crashes = self.crashes.lock();
+                    let crash = *crashes == self.crash_at;
+                    *crashes += 1;
+                    crash
+                }
+                FaultDraw::RetainByte { index } => index < self.keep,
+                _ => false,
+            }
+        }
+
+        fn between(&self, _: &FaultDecision<'_>, range: std::ops::Range<u64>) -> u64 {
+            range.start
+        }
+    }
+
+    fn crash_config(policy: Arc<CrashAt>) -> deterministic::Config {
+        deterministic::Config::default()
+            .with_storage_fault_config(
+                FaultConfig::default()
+                    .write(WriteConfig {
+                        failure_rate: probability!(0.0),
+                        retention_rate: probability!(0.5),
+                        mode: PartialWriteMode::Prefix,
+                    })
+                    .crash(probability!(0.5)),
+            )
+            .with_storage_fault_policy(policy)
+    }
+
+    #[test]
+    fn test_crash_in_write_tears_it_and_stops_the_process() {
+        let policy = CrashAt::new(1, 3);
+        deterministic::Runner::new(crash_config(policy.clone())).start(|ctx| async move {
+            let (node, process) = ctx.process("node", |partition| partition == "node");
+            let (peer, _peer_process) = ctx.process("peer", |partition| partition == "peer");
+            let after = Arc::new(AtomicUsize::new(0));
+            let reached = after.clone();
+            let sibling = ticker(node.child("sibling"));
+            let peer_ticks = ticker(peer.child("ticker"));
+            let writer = node.child("writer").spawn(move |ctx| async move {
+                let (blob, _) = ctx.open("node", b"journal").await.unwrap();
+                blob.write_at(0, b"durable".to_vec(), WriteOptions::SYNC)
+                    .await
+                    .unwrap();
+                // Crashes the process from within this synced write.
+                blob.write_at(7, b"pending".to_vec(), WriteOptions::SYNC)
+                    .await
+                    .unwrap();
+                reached.fetch_add(1, Ordering::SeqCst);
+            });
+            assert!(writer.await.is_err(), "the crashed writer completed");
+            assert!(process.crashed());
+            assert_eq!(after.load(Ordering::SeqCst), 0, "code after the crash ran");
+            let frozen = sibling.load(Ordering::SeqCst);
+            let peer_before = peer_ticks.load(Ordering::SeqCst);
+            ctx.sleep(Duration::from_millis(10)).await;
+            assert_eq!(sibling.load(Ordering::SeqCst), frozen, "a crashed task ran");
+            assert!(
+                peer_ticks.load(Ordering::SeqCst) > peer_before,
+                "the peer stopped"
+            );
+
+            // The crashed write was resolved as unsynced: only its first 3 bytes survive.
+            let (blob, len) = ctx.open("node", b"journal").await.unwrap();
+            assert_eq!(len, 10);
+            let read = blob.read_at(0, 10, ReadOptions::default()).await.unwrap();
+            assert_eq!(read.coalesce(), b"durablepen");
+
+            // Crashing an already crashed process does nothing.
+            process.crash();
+        });
+        assert_eq!(*policy.crashes.lock(), 2);
+    }
+
+    #[test]
+    fn test_crash_in_sync_loses_unsynced_writes() {
+        // Decisions: write, sync, write, then the crashing sync.
+        deterministic::Runner::new(crash_config(CrashAt::new(3, 0))).start(|ctx| async move {
+            let (node, process) = ctx.process("node", |partition| partition == "node");
+            let writer = node.spawn(move |ctx| async move {
+                let (blob, _) = ctx.open("node", b"journal").await.unwrap();
+                blob.write_at(0, b"durable".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+                blob.sync().await.unwrap();
+                blob.write_at(7, b"pending".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+                // Crashes the process instead of syncing.
+                blob.sync().await.unwrap();
+            });
+            assert!(writer.await.is_err());
+            assert!(process.crashed());
+            let (_, len) = ctx.open("node", b"journal").await.unwrap();
+            assert_eq!(len, 7);
+        });
+    }
+
+    #[test]
+    fn test_crash_rate_ignores_unowned_partitions() {
+        let policy = CrashAt::new(0, 0);
+        deterministic::Runner::new(crash_config(policy.clone())).start(|ctx| async move {
+            let (_node, process) = ctx.process("node", |partition| partition == "node");
+            let (blob, _) = ctx.open("other", b"journal").await.unwrap();
+            blob.write_at(0, b"data".to_vec(), WriteOptions::SYNC)
+                .await
+                .unwrap();
+            blob.sync().await.unwrap();
+            assert!(!process.crashed());
+        });
+        assert_eq!(
+            *policy.crashes.lock(),
+            0,
+            "drew a crash for an unowned partition"
+        );
+    }
+
+    #[test]
+    fn test_crash_in_storage_restarts_from_surviving_contents() {
+        // A restarted process owning the same partitions can be crashed from storage again,
+        // and its predecessor no longer owns them.
+        deterministic::Runner::new(crash_config(CrashAt::new(1, 0))).start(|ctx| async move {
+            for incarnation in 0..2u8 {
+                let (node, process) = ctx.process("node", |partition| partition == "node");
+                let writer = node.spawn(move |ctx| async move {
+                    let (blob, len) = ctx.open("node", b"journal").await.unwrap();
+                    blob.write_at(len, vec![incarnation], WriteOptions::SYNC)
+                        .await
+                        .unwrap();
+                    blob.write_at(len + 1, vec![incarnation], WriteOptions::SYNC)
+                        .await
+                        .unwrap();
+                });
+                let result = writer.await;
+                assert_eq!(result.is_err(), incarnation == 0);
+                assert_eq!(process.crashed(), incarnation == 0);
+            }
+            let (_, len) = ctx.open("node", b"journal").await.unwrap();
+            assert_eq!(len, 3);
+        });
     }
 
     #[test]
