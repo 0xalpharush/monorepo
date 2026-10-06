@@ -14,6 +14,7 @@ use rand::RngExt as _;
 use std::{
     collections::{BTreeMap, HashSet},
     io::Error as IoError,
+    ops::Range,
     sync::{
         Arc, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
@@ -21,8 +22,8 @@ use std::{
 };
 
 /// Operation types for fault injection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Op {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Op {
     Open,
     Read,
     Write,
@@ -192,10 +193,67 @@ impl Config {
     }
 }
 
+/// What one storage fault decision determines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Draw {
+    /// Whether the operation fails.
+    Fail,
+    /// Whether a failed resize leaves the file at an intermediate length.
+    Partial,
+    /// The intermediate length of a partial resize.
+    PartialLength,
+    /// Whether a crash keeps a successful, unsynced resize.
+    RetainResize,
+    /// Whether byte `index` of a failed or unsynced write survives a crash.
+    RetainByte {
+        /// The byte's position within the write.
+        index: usize,
+    },
+}
+
+/// One storage fault decision: the file and operation it concerns, and what it determines.
+#[derive(Debug, Clone, Copy)]
+pub struct Decision<'a> {
+    /// The partition operated on.
+    pub partition: &'a str,
+    /// The file operated on, or `None` for a partition-wide operation (scan or remove).
+    pub name: Option<&'a [u8]>,
+    /// The operation the decision concerns.
+    pub op: Op,
+    /// What the decision determines.
+    pub draw: Draw,
+}
+
+/// Makes every storage fault decision that the fault [Config] enables.
+///
+/// The configured rates still select which faults are possible; a policy only decides each
+/// occurrence. A policy that sees every [Decision] can record, replay, or override individual
+/// faults without disturbing other uses of the runtime's randomness.
+pub trait Policy: Send + Sync {
+    /// Whether the event `decision` describes occurs, given its configured probability `rate`.
+    fn occurs(&self, decision: &Decision<'_>, rate: Probability) -> bool;
+
+    /// A value drawn uniformly from the non-empty `range` (a partial resize length).
+    fn between(&self, decision: &Decision<'_>, range: Range<u64>) -> u64;
+}
+
+/// The default [Policy]: every decision draws from one shared RNG, in issue order.
+pub struct SharedRng(pub Arc<Mutex<BoxDynRng>>);
+
+impl Policy for SharedRng {
+    fn occurs(&self, _: &Decision<'_>, rate: Probability) -> bool {
+        rate.sample(&mut **self.0.lock())
+    }
+
+    fn between(&self, _: &Decision<'_>, range: Range<u64>) -> u64 {
+        self.0.lock().random_range(range)
+    }
+}
+
 /// Shared fault injection context.
 #[derive(Clone)]
 struct Oracle {
-    rng: Arc<Mutex<BoxDynRng>>,
+    policy: Arc<dyn Policy>,
     config: Arc<RwLock<Config>>,
 }
 
@@ -274,13 +332,24 @@ type FileKey = (String, Vec<u8>);
 
 /// Identifies one live file generation and serializes its mutations across handles.
 struct FileGeneration {
+    file: FileKey,
     mutation: AsyncMutex<()>,
 }
 
 impl FileGeneration {
-    fn new() -> Self {
+    fn new(file: FileKey) -> Self {
         Self {
+            file,
             mutation: AsyncMutex::new(()),
+        }
+    }
+
+    fn decision(&self, op: Op, draw: Draw) -> Decision<'_> {
+        Decision {
+            partition: &self.file.0,
+            name: Some(&self.file.1),
+            op,
+            draw,
         }
     }
 }
@@ -332,16 +401,20 @@ fn resolve_pending_sync<B>(
 }
 
 impl Oracle {
-    /// Check if a fault should be injected for the given operation.
-    fn should_fail(&self, op: Op) -> bool {
-        self.roll(self.config.read().rate_for(op))
+    /// Check if a fault should be injected for `op`, as identified by `decision`.
+    fn should_fail(&self, decision: &Decision<'_>) -> bool {
+        let rate = self.config.read().rate_for(decision.op);
+        self.roll(decision, rate)
     }
 
     /// Check if a write fault should be injected.
     /// Reads config once to avoid nested lock acquisition.
-    fn check_write_fault(&self) -> (bool, Option<(PartialWriteMode, Probability)>) {
+    fn check_write_fault(
+        &self,
+        file: &FileGeneration,
+    ) -> (bool, Option<(PartialWriteMode, Probability)>) {
         let config = self.config.read();
-        let fail = self.roll(config.rate_for(Op::Write));
+        let fail = self.roll(&file.decision(Op::Write, Draw::Fail), config.rate_for(Op::Write));
         let retention = config
             .write_rate
             .map(|config| (config.mode, config.retention_rate))
@@ -351,24 +424,25 @@ impl Oracle {
 
     /// Check if a resize fault should be injected and snapshot its crash outcome.
     /// Reads config once to avoid nested lock acquisition.
-    fn check_resize_fault(&self) -> (bool, Probability, bool) {
+    fn check_resize_fault(&self, file: &FileGeneration) -> (bool, Probability, bool) {
         let config = self.config.read();
         let Some(resize_config) = config.resize_rate else {
             return (false, probability!(0.0), false);
         };
         let failure_rate = config.rate_for(Op::Resize);
-        let fail = self.roll(failure_rate);
-        let retain = !fail && self.roll(failure_rate);
+        let fail = self.roll(&file.decision(Op::Resize, Draw::Fail), failure_rate);
+        let retain =
+            !fail && self.roll(&file.decision(Op::Resize, Draw::RetainResize), failure_rate);
         (fail, resize_config.partial_rate, retain)
     }
 
-    /// Check if an event should occur based on a probability rate.
-    fn roll(&self, rate: Probability) -> bool {
-        rate.sample(&mut **self.rng.lock())
+    /// Check if the event `decision` describes occurs, given its probability.
+    fn roll(&self, decision: &Decision<'_>, rate: Probability) -> bool {
+        self.policy.occurs(decision, rate)
     }
 
     /// Generate a random value strictly between `from` and `to`, or None if not possible.
-    fn random_between(&self, from: u64, to: u64) -> Option<u64> {
+    fn random_between(&self, file: &FileGeneration, from: u64, to: u64) -> Option<u64> {
         if from == to {
             return None;
         }
@@ -376,36 +450,43 @@ impl Oracle {
         if max - min <= 1 {
             return None;
         }
-        Some(self.rng.lock().random_range(min + 1..max))
+        Some(
+            self.policy
+                .between(&file.decision(Op::Resize, Draw::PartialLength), min + 1..max),
+        )
     }
 
     /// Select retained byte positions according to a snapshotted write policy.
     fn retained_bytes(
         &self,
+        file: &FileGeneration,
         len: usize,
         (mode, retention_rate): (PartialWriteMode, Probability),
     ) -> Vec<bool> {
-        let mut rng = self.rng.lock();
+        let retained =
+            |index| self.roll(&file.decision(Op::Write, Draw::RetainByte { index }), retention_rate);
         match mode {
             PartialWriteMode::Prefix => {
                 let mut positions = vec![false; len];
-                let retained = (0..len)
-                    .take_while(|_| retention_rate.sample(&mut **rng))
-                    .count();
-                positions[..retained].fill(true);
+                let kept = (0..len).take_while(|index| retained(*index)).count();
+                positions[..kept].fill(true);
                 positions
             }
-            PartialWriteMode::Subset => (0..len)
-                .map(|_| retention_rate.sample(&mut **rng))
-                .collect(),
+            PartialWriteMode::Subset => (0..len).map(retained).collect(),
         }
     }
 
-    /// Try to generate a partial operation target. Returns Some if both the rate
-    /// check passes and an intermediate value exists between `from` and `to`.
-    fn try_partial(&self, rate: Probability, from: u64, to: u64) -> Option<u64> {
-        if self.roll(rate) {
-            self.random_between(from, to)
+    /// Try to generate a partial resize target. Returns Some if both the rate check passes and
+    /// an intermediate value exists between `from` and `to`.
+    fn try_partial(
+        &self,
+        file: &FileGeneration,
+        rate: Probability,
+        from: u64,
+        to: u64,
+    ) -> Option<u64> {
+        if self.roll(&file.decision(Op::Resize, Draw::Partial), rate) {
+            self.random_between(file, from, to)
         } else {
             None
         }
@@ -424,11 +505,17 @@ pub struct Storage<S: crate::Storage> {
 }
 
 impl<S: crate::Storage> Storage<S> {
-    /// Create a new faulty storage wrapper.
+    /// Create a new faulty storage wrapper whose faults draw from the shared `rng`.
+    #[cfg(test)]
     pub fn new(inner: S, rng: Arc<Mutex<BoxDynRng>>, config: Arc<RwLock<Config>>) -> Self {
+        Self::with_policy(inner, Arc::new(SharedRng(rng)), config)
+    }
+
+    /// Create a faulty storage wrapper whose fault decisions `policy` makes.
+    pub fn with_policy(inner: S, policy: Arc<dyn Policy>, config: Arc<RwLock<Config>>) -> Self {
         Self {
             inner,
-            ctx: Oracle { rng, config },
+            ctx: Oracle { policy, config },
             pending: Arc::new(Mutex::new(Vec::new())),
             generations: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -437,6 +524,11 @@ impl<S: crate::Storage> Storage<S> {
     /// Get a reference to the inner storage.
     pub const fn inner(&self) -> &S {
         &self.inner
+    }
+
+    /// The policy deciding this storage's faults.
+    pub fn policy(&self) -> Arc<dyn Policy> {
+        self.ctx.policy.clone()
     }
 
     /// Get access to the fault configuration for dynamic modification.
@@ -453,7 +545,7 @@ impl<S: crate::Storage> Storage<S> {
                 .get(&key)
                 .and_then(Weak::upgrade)
                 .unwrap_or_else(|| {
-                    let generation = Arc::new(FileGeneration::new());
+                    let generation = Arc::new(FileGeneration::new(key.clone()));
                     generations.insert(key.clone(), Arc::downgrade(&generation));
                     generation
                 })
@@ -492,7 +584,12 @@ impl<S: crate::Storage> Storage<S> {
         partition: &str,
         name: Option<&[u8]>,
     ) -> Result<Retired<S::Blob>, Error> {
-        if self.ctx.should_fail(Op::Remove) {
+        if self.ctx.should_fail(&Decision {
+            partition,
+            name,
+            op: Op::Remove,
+            draw: Draw::Fail,
+        }) {
             return Err(injected_io_error().into());
         }
         self.inner.remove(partition, name).await?;
@@ -519,7 +616,20 @@ impl Storage<crate::storage::memory::Storage> {
 
     /// Replay selected crash outcomes in issue order.
     pub(crate) fn crash(&self) -> Result<(), Error> {
-        let pending = std::mem::take(&mut *self.pending.lock());
+        self.crash_partitions(|_| true)
+    }
+
+    /// Replay the selected crash outcomes of every partition `affected` selects, in issue order,
+    /// and retire their live blob generations; other partitions keep their pending mutations.
+    ///
+    /// The caller must already have stopped everything that holds a handle into an affected
+    /// partition: a crashed handle can no longer publish writes.
+    pub(crate) fn crash_partitions(&self, affected: impl Fn(&str) -> bool) -> Result<(), Error> {
+        let pending: Vec<_> = self
+            .pending
+            .lock()
+            .extract_if(.., |mutation| affected(&mutation.generation().file.0))
+            .collect();
         let mut synced = HashSet::new();
         let mut replay = Vec::with_capacity(pending.len());
         for mutation in pending.into_iter().rev() {
@@ -539,16 +649,17 @@ impl Storage<crate::storage::memory::Storage> {
         for mutation in replay.into_iter().rev() {
             match mutation {
                 PendingMutation::Write {
+                    generation,
                     blob,
                     offset,
                     bufs,
                     retention,
                     selection_offset,
-                    ..
                 } => {
-                    let selected = retention
-                        .selected
-                        .get_or_init(|| self.ctx.retained_bytes(retention.len, retention.policy));
+                    let selected = retention.selected.get_or_init(|| {
+                        self.ctx
+                            .retained_bytes(&generation, retention.len, retention.policy)
+                    });
                     let selection_end = selection_offset
                         .checked_add(bufs.remaining())
                         .expect("a pending-write fragment stays within its selection");
@@ -565,6 +676,11 @@ impl Storage<crate::storage::memory::Storage> {
                 PendingMutation::Sync { .. } => unreachable!("sync markers are not replayed"),
             }
         }
+        // Retire only after replay: replay publishes through the crashed generations.
+        self.generations
+            .lock()
+            .retain(|(partition, _), _| !affected(partition));
+        self.inner.retire_partitions(&affected);
         Ok(())
     }
 }
@@ -583,7 +699,12 @@ impl<S: crate::Storage> crate::Storage for Storage<S> {
         name: &[u8],
         versions: std::ops::RangeInclusive<BlobVersion>,
     ) -> Result<(Self::Blob, u64, BlobVersion), Error> {
-        if self.ctx.should_fail(Op::Open) {
+        if self.ctx.should_fail(&Decision {
+            partition,
+            name: Some(name),
+            op: Op::Open,
+            draw: Draw::Fail,
+        }) {
             return Err(injected_io_error().into());
         }
         let (blob, len, blob_version) =
@@ -601,7 +722,12 @@ impl<S: crate::Storage> crate::Storage for Storage<S> {
     }
 
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
-        if self.ctx.should_fail(Op::Scan) {
+        if self.ctx.should_fail(&Decision {
+            partition,
+            name: None,
+            op: Op::Scan,
+            draw: Draw::Fail,
+        }) {
             return Err(injected_io_error().into());
         }
         self.inner.scan(partition).await
@@ -778,7 +904,9 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         len: usize,
         options: ReadOptions,
     ) -> Result<IoBufsMut, Error> {
-        if self.ctx.should_fail(Op::Read) {
+        if self.ctx
+            .should_fail(&self.generation.decision(Op::Read, Draw::Fail))
+        {
             return Err(injected_io_error().into());
         }
         self.inner.read_at(offset, len, options).await
@@ -791,7 +919,9 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         bufs: impl Into<IoBufsMut> + Send,
         options: ReadOptions,
     ) -> Result<IoBufsMut, Error> {
-        if self.ctx.should_fail(Op::Read) {
+        if self.ctx
+            .should_fail(&self.generation.decision(Op::Read, Draw::Fail))
+        {
             return Err(injected_io_error().into());
         }
         self.inner
@@ -814,12 +944,12 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         offset
             .checked_add(total_bytes)
             .ok_or(Error::OffsetOverflow)?;
-        let (should_fail, write_retention) = self.ctx.check_write_fault();
+        let (should_fail, write_retention) = self.ctx.check_write_fault(&self.generation);
         let _mutation = self.generation.mutation.lock().await;
         if should_fail {
             if let Some(retention) = write_retention {
                 let len = bufs.remaining();
-                let retained = self.ctx.retained_bytes(len, retention);
+                let retained = self.ctx.retained_bytes(&self.generation, len, retention);
                 let bufs = bufs.coalesce();
                 let mut position = 0;
                 while position < len {
@@ -851,7 +981,11 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
             return Err(injected_io_error().into());
         }
 
-        if sync && self.ctx.should_fail(Op::Sync) {
+        if sync
+            && self
+                .ctx
+                .should_fail(&self.generation.decision(Op::Sync, Draw::Fail))
+        {
             let pending = write_retention.map(|retention| (bufs.clone(), retention));
             self.inner
                 .write_at(offset, bufs, options.without(WriteOptions::SYNC))
@@ -881,11 +1015,14 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
     }
 
     async fn resize(&self, len: u64) -> Result<(), Error> {
-        let (should_fail, partial_rate, retain) = self.ctx.check_resize_fault();
+        let (should_fail, partial_rate, retain) = self.ctx.check_resize_fault(&self.generation);
         let _mutation = self.generation.mutation.lock().await;
         if should_fail {
             let current = self.size.load(Ordering::Relaxed);
-            if let Some(len) = self.ctx.try_partial(partial_rate, current, len) {
+            if let Some(len) = self
+                .ctx
+                .try_partial(&self.generation, partial_rate, current, len)
+            {
                 self.inner.resize(len).await?;
                 self.record_pending_resize(len);
                 self.size.store(len, Ordering::Relaxed);
@@ -902,7 +1039,10 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
     }
 
     async fn sync(&self) -> Result<(), Error> {
-        if self.ctx.should_fail(Op::Sync) {
+        if self
+            .ctx
+            .should_fail(&self.generation.decision(Op::Sync, Draw::Fail))
+        {
             return Err(injected_io_error().into());
         }
         let _mutation = self.generation.mutation.lock().await;
@@ -912,7 +1052,10 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
     }
 
     async fn start_sync(&self) -> Handle<()> {
-        if self.ctx.should_fail(Op::Sync) {
+        if self
+            .ctx
+            .should_fail(&self.generation.decision(Op::Sync, Draw::Fail))
+        {
             return Handle::ready(Err(injected_io_error().into()));
         }
         let _mutation = self.generation.mutation.lock().await;
@@ -1086,6 +1229,11 @@ mod tests {
         inner: MemStorage,
         storage: Storage<MemStorage>,
         config: Arc<RwLock<Config>>,
+        rng: Arc<Mutex<BoxDynRng>>,
+    }
+
+    fn test_file() -> FileGeneration {
+        FileGeneration::new(("partition".into(), b"name".to_vec()))
     }
 
     impl Harness {
@@ -1101,11 +1249,12 @@ mod tests {
             let inner = MemStorage::new(test_pool());
             let rng = Arc::new(Mutex::new(rng));
             let config = Arc::new(RwLock::new(config));
-            let storage = Storage::new(inner.clone(), rng, config.clone());
+            let storage = Storage::new(inner.clone(), rng.clone(), config.clone());
             Self {
                 inner,
                 storage,
                 config,
+                rng,
             }
         }
     }
@@ -1147,7 +1296,7 @@ mod tests {
             let blob = Blob::new(
                 h.storage.ctx.clone(),
                 pending,
-                Arc::new(FileGeneration::new()),
+                Arc::new(test_file()),
                 gated,
                 4,
             );
@@ -1191,7 +1340,7 @@ mod tests {
         let blob = Blob::new(
             h.storage.ctx.clone(),
             pending.clone(),
-            Arc::new(FileGeneration::new()),
+            Arc::new(test_file()),
             gated,
             4,
         );
@@ -1286,7 +1435,7 @@ mod tests {
             let blob = Blob::new(
                 h.storage.ctx.clone(),
                 pending.clone(),
-                Arc::new(FileGeneration::new()),
+                Arc::new(test_file()),
                 gated,
                 5,
             );
@@ -1874,20 +2023,26 @@ mod tests {
     #[test]
     fn test_probability_endpoints_do_not_consume_randomness() {
         let expected = Harness::with_seed(0, Config::default());
-        let expected = expected.storage.ctx.rng.lock().random::<u64>();
+        let expected = expected.rng.lock().random::<u64>();
 
         let h = Harness::with_seed(0, Config::default());
+        let file = test_file();
         for (probability, outcome) in [(probability!(0.0), false), (probability!(1.0), true)] {
-            assert_eq!(h.storage.ctx.roll(probability), outcome);
+            assert_eq!(
+                h.storage
+                    .ctx
+                    .roll(&file.decision(Op::Read, Draw::Fail), probability),
+                outcome
+            );
             for mode in [PartialWriteMode::Prefix, PartialWriteMode::Subset] {
                 assert_eq!(
-                    h.storage.ctx.retained_bytes(4, (mode, probability)),
+                    h.storage.ctx.retained_bytes(&file, 4, (mode, probability)),
                     [outcome; 4]
                 );
             }
         }
 
-        assert_eq!(h.storage.ctx.rng.lock().random::<u64>(), expected);
+        assert_eq!(h.rng.lock().random::<u64>(), expected);
     }
 
     #[test]
@@ -1899,7 +2054,7 @@ mod tests {
             let retained = h
                 .storage
                 .ctx
-                .retained_bytes(4, (PartialWriteMode::Prefix, probability!(0.5)));
+                .retained_bytes(&test_file(), 4, (PartialWriteMode::Prefix, probability!(0.5)));
             let prefix_len = retained.iter().take_while(|&&keep| keep).count();
             assert!(retained[prefix_len..].iter().all(|&keep| !keep));
             observed[prefix_len] = true;
@@ -1909,7 +2064,7 @@ mod tests {
         assert!(
             h.storage
                 .ctx
-                .retained_bytes(0, (PartialWriteMode::Prefix, probability!(0.5)))
+                .retained_bytes(&test_file(), 0, (PartialWriteMode::Prefix, probability!(0.5)))
                 .is_empty()
         );
     }
