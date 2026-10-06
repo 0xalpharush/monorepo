@@ -133,6 +133,10 @@ pub struct Config {
 
     /// Failure rate for `scan` operations.
     pub scan_rate: Option<Probability>,
+
+    /// Probability that a successful, non-empty `read_at` returns its data with exactly one bit
+    /// flipped. Durable contents are unchanged.
+    pub corrupt_read_rate: Option<Probability>,
 }
 
 impl Config {
@@ -191,6 +195,12 @@ impl Config {
         self.scan_rate = Some(rate);
         self
     }
+
+    /// Set the probability that a successful read returns data with one bit flipped.
+    pub const fn corrupt_read(mut self, rate: Probability) -> Self {
+        self.corrupt_read_rate = Some(rate);
+        self
+    }
 }
 
 /// What one storage fault decision determines.
@@ -209,6 +219,10 @@ pub enum Draw {
         /// The byte's position within the write.
         index: usize,
     },
+    /// Whether a successful read returns corrupted data.
+    Corrupt,
+    /// The index of the bit flipped in a corrupted read (bit `i` is bit `i % 8` of byte `i / 8`).
+    CorruptBit,
 }
 
 /// One storage fault decision: the file and operation it concerns, and what it determines.
@@ -233,7 +247,8 @@ pub trait Policy: Send + Sync {
     /// Whether the event `decision` describes occurs, given its configured probability `rate`.
     fn occurs(&self, decision: &Decision<'_>, rate: Probability) -> bool;
 
-    /// A value drawn uniformly from the non-empty `range` (a partial resize length).
+    /// A value drawn uniformly from the non-empty `range` (a partial resize length or the bit
+    /// flipped by a corrupted read).
     fn between(&self, decision: &Decision<'_>, range: Range<u64>) -> u64;
 }
 
@@ -414,7 +429,10 @@ impl Oracle {
         file: &FileGeneration,
     ) -> (bool, Option<(PartialWriteMode, Probability)>) {
         let config = self.config.read();
-        let fail = self.roll(&file.decision(Op::Write, Draw::Fail), config.rate_for(Op::Write));
+        let fail = self.roll(
+            &file.decision(Op::Write, Draw::Fail),
+            config.rate_for(Op::Write),
+        );
         let retention = config
             .write_rate
             .map(|config| (config.mode, config.retention_rate))
@@ -450,10 +468,10 @@ impl Oracle {
         if max - min <= 1 {
             return None;
         }
-        Some(
-            self.policy
-                .between(&file.decision(Op::Resize, Draw::PartialLength), min + 1..max),
-        )
+        Some(self.policy.between(
+            &file.decision(Op::Resize, Draw::PartialLength),
+            min + 1..max,
+        ))
     }
 
     /// Select retained byte positions according to a snapshotted write policy.
@@ -463,8 +481,12 @@ impl Oracle {
         len: usize,
         (mode, retention_rate): (PartialWriteMode, Probability),
     ) -> Vec<bool> {
-        let retained =
-            |index| self.roll(&file.decision(Op::Write, Draw::RetainByte { index }), retention_rate);
+        let retained = |index| {
+            self.roll(
+                &file.decision(Op::Write, Draw::RetainByte { index }),
+                retention_rate,
+            )
+        };
         match mode {
             PartialWriteMode::Prefix => {
                 let mut positions = vec![false; len];
@@ -474,6 +496,44 @@ impl Oracle {
             }
             PartialWriteMode::Subset => (0..len).map(retained).collect(),
         }
+    }
+
+    /// Flip one bit of a successful read's data if the configured corruption rate selects it.
+    ///
+    /// Makes no draw when corruption is disabled or the read is empty.
+    fn corrupt_read(&self, file: &FileGeneration, bufs: &mut IoBufsMut) {
+        let Some(rate) = self
+            .config
+            .read()
+            .corrupt_read_rate
+            .filter(|rate| !rate.is_zero())
+        else {
+            return;
+        };
+        let bits = (bufs.len() as u64)
+            .checked_mul(8)
+            .expect("read length in bits fits in u64");
+        if bits == 0 || !self.roll(&file.decision(Op::Read, Draw::Corrupt), rate) {
+            return;
+        }
+        let bit = self
+            .policy
+            .between(&file.decision(Op::Read, Draw::CorruptBit), 0..bits);
+        assert!(bit < bits, "policy drew bit {bit} outside 0..{bits}");
+        let mask = 1u8 << (bit % 8);
+        let mut remaining = Some(bit / 8);
+        bufs.for_each_chunk_mut(|chunk| {
+            let Some(index) = remaining else {
+                return;
+            };
+            let len = chunk.len() as u64;
+            if index < len {
+                chunk.as_mut()[index as usize] ^= mask;
+                remaining = None;
+            } else {
+                remaining = Some(index - len);
+            }
+        });
     }
 
     /// Try to generate a partial resize target. Returns Some if both the rate check passes and
@@ -904,12 +964,15 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         len: usize,
         options: ReadOptions,
     ) -> Result<IoBufsMut, Error> {
-        if self.ctx
+        if self
+            .ctx
             .should_fail(&self.generation.decision(Op::Read, Draw::Fail))
         {
             return Err(injected_io_error().into());
         }
-        self.inner.read_at(offset, len, options).await
+        let mut bufs = self.inner.read_at(offset, len, options).await?;
+        self.ctx.corrupt_read(&self.generation, &mut bufs);
+        Ok(bufs)
     }
 
     async fn read_at_buf(
@@ -919,14 +982,18 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         bufs: impl Into<IoBufsMut> + Send,
         options: ReadOptions,
     ) -> Result<IoBufsMut, Error> {
-        if self.ctx
+        if self
+            .ctx
             .should_fail(&self.generation.decision(Op::Read, Draw::Fail))
         {
             return Err(injected_io_error().into());
         }
-        self.inner
+        let mut bufs = self
+            .inner
             .read_at_buf(offset, len, bufs.into(), options)
-            .await
+            .await?;
+        self.ctx.corrupt_read(&self.generation, &mut bufs);
+        Ok(bufs)
     }
 
     async fn write_at(
@@ -2051,10 +2118,11 @@ mod tests {
         let mut observed = [false; 5];
         for seed in 0..512 {
             let h = Harness::with_seed(seed, Config::default());
-            let retained = h
-                .storage
-                .ctx
-                .retained_bytes(&test_file(), 4, (PartialWriteMode::Prefix, probability!(0.5)));
+            let retained = h.storage.ctx.retained_bytes(
+                &test_file(),
+                4,
+                (PartialWriteMode::Prefix, probability!(0.5)),
+            );
             let prefix_len = retained.iter().take_while(|&&keep| keep).count();
             assert!(retained[prefix_len..].iter().all(|&keep| !keep));
             observed[prefix_len] = true;
@@ -2064,7 +2132,11 @@ mod tests {
         assert!(
             h.storage
                 .ctx
-                .retained_bytes(&test_file(), 0, (PartialWriteMode::Prefix, probability!(0.5)))
+                .retained_bytes(
+                    &test_file(),
+                    0,
+                    (PartialWriteMode::Prefix, probability!(0.5))
+                )
                 .is_empty()
         );
     }
@@ -2932,5 +3004,158 @@ mod tests {
 
         let (_, size) = h.inner.open("partition", b"test").await.unwrap();
         assert_eq!(size, 0);
+    }
+
+    /// The positions of bits that differ between `a` and `b`.
+    fn differing_bits(a: &[u8], b: &[u8]) -> Vec<u64> {
+        assert_eq!(a.len(), b.len());
+        (0..a.len() as u64 * 8)
+            .filter(|bit| (a[(bit / 8) as usize] ^ b[(bit / 8) as usize]) & (1 << (bit % 8)) != 0)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_read_corruption_flips_exactly_one_bit() {
+        let data: Vec<u8> = (0..64).collect();
+        let h = Harness::new(Config::default().corrupt_read(probability!(1.0)));
+        let (blob, _) = h.storage.open("partition", b"test").await.unwrap();
+        blob.write_at(0, data.clone(), WriteOptions::SYNC)
+            .await
+            .unwrap();
+
+        let mut flipped = HashSet::new();
+        for _ in 0..32 {
+            let read = blob.read_at(0, 64, ReadOptions::default()).await.unwrap();
+            let bits = differing_bits(read.coalesce().as_ref(), &data);
+            assert_eq!(bits.len(), 1);
+            flipped.insert(bits[0]);
+
+            let chunks: IoBufsMut =
+                vec![IoBufMut::with_capacity(5), IoBufMut::with_capacity(59)].into();
+            let read = blob
+                .read_at_buf(0, 64, chunks, ReadOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(differing_bits(read.coalesce().as_ref(), &data).len(), 1);
+        }
+        assert!(flipped.len() > 1, "the flipped bit is drawn per read");
+
+        // Corruption is transient: durable contents are unchanged.
+        let (durable, _) = h.inner.open("partition", b"test").await.unwrap();
+        assert_eq!(
+            durable
+                .read_at(0, 64, ReadOptions::default())
+                .await
+                .unwrap()
+                .coalesce(),
+            data.as_slice()
+        );
+    }
+
+    /// Corrupts every read of one file, flipping bit `bit`.
+    struct CorruptFile {
+        name: &'static [u8],
+        bit: u64,
+    }
+
+    impl Policy for CorruptFile {
+        fn occurs(&self, decision: &Decision<'_>, _: Probability) -> bool {
+            decision.draw == Draw::Corrupt && decision.name == Some(self.name)
+        }
+
+        fn between(&self, decision: &Decision<'_>, range: Range<u64>) -> u64 {
+            assert_eq!(decision.op, Op::Read);
+            assert_eq!(decision.draw, Draw::CorruptBit);
+            assert_eq!(range, 0..64);
+            self.bit
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_corruption_flips_the_policy_bit_across_chunks() {
+        let inner = MemStorage::new(test_pool());
+        let storage = Storage::with_policy(
+            inner,
+            Arc::new(CorruptFile {
+                name: b"target",
+                bit: 5 * 8 + 3,
+            }),
+            Arc::new(RwLock::new(
+                Config::default().corrupt_read(probability!(0.5)),
+            )),
+        );
+        for name in [&b"target"[..], b"other"] {
+            let (blob, _) = storage.open("partition", name).await.unwrap();
+            blob.write_at(0, b"abcdefgh", WriteOptions::SYNC)
+                .await
+                .unwrap();
+            let chunks: IoBufsMut =
+                vec![IoBufMut::with_capacity(4), IoBufMut::with_capacity(4)].into();
+            let read = blob
+                .read_at_buf(0, 8, chunks, ReadOptions::default())
+                .await
+                .unwrap();
+            // Bit 3 of byte 5 (the second chunk): 'f' (0x66) becomes 'n' (0x6e).
+            let expected: &[u8] = if name == b"target" {
+                b"abcdengh"
+            } else {
+                b"abcdefgh"
+            };
+            assert_eq!(read.coalesce(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_corruption_disabled_makes_no_draws() {
+        // An exhausted scripted RNG panics if sampled.
+        for config in [
+            Config::default(),
+            Config::default().corrupt_read(probability!(0.0)),
+        ] {
+            let h = Harness::with_rng(Box::new(ScriptedRng::new([])), config);
+            let (blob, _) = h.storage.open("partition", b"test").await.unwrap();
+            blob.write_at(0, b"data", WriteOptions::SYNC).await.unwrap();
+            let read = blob.read_at(0, 4, ReadOptions::default()).await.unwrap();
+            assert_eq!(read.coalesce(), b"data");
+        }
+
+        // An empty read has no bit to flip.
+        let h = Harness::with_rng(
+            Box::new(ScriptedRng::new([])),
+            Config::default().corrupt_read(probability!(0.5)),
+        );
+        let (blob, _) = h.storage.open("partition", b"test").await.unwrap();
+        assert!(
+            blob.read_at(0, 0, ReadOptions::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_corruption_is_deterministic() {
+        async fn run(seed: u64) -> Vec<Vec<u8>> {
+            let h = Harness::with_seed(seed, Config::default().corrupt_read(probability!(0.5)));
+            let (blob, _) = h.storage.open("partition", b"test").await.unwrap();
+            blob.write_at(0, vec![0u8; 16], WriteOptions::SYNC)
+                .await
+                .unwrap();
+            let mut reads = Vec::new();
+            for _ in 0..16 {
+                let read = blob.read_at(0, 16, ReadOptions::default()).await.unwrap();
+                reads.push(read.coalesce().as_ref().to_vec());
+            }
+            reads
+        }
+
+        let reads = run(42).await;
+        assert_eq!(reads, run(42).await);
+        assert_ne!(reads, run(7).await);
+        let corrupted = reads
+            .iter()
+            .filter(|read| read.iter().any(|b| *b != 0))
+            .count();
+        assert!(corrupted > 0 && corrupted < reads.len());
     }
 }

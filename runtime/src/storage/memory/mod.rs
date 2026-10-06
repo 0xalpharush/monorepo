@@ -177,14 +177,12 @@ impl Storage {
     }
 
     /// Return a copy of a blob's durable raw contents without interpreting its container header.
-    #[cfg(any(test, feature = "test-utils"))]
     pub fn raw_blob(&self, partition: &str, name: &[u8]) -> Option<Vec<u8>> {
         self.partitions.lock().get(partition)?.get(name).cloned()
     }
 
     /// Return a copy of a blob's durable logical contents, or `None` when the blob is missing or
     /// its container header does not resolve.
-    #[cfg(any(test, feature = "test-utils"))]
     pub fn logical_blob(&self, partition: &str, name: &[u8]) -> Option<Vec<u8>> {
         let content = self.raw_blob(partition, name)?;
         let versions = BlobVersion::new(0)..=BlobVersion::new(u16::MAX);
@@ -193,7 +191,6 @@ impl Storage {
     }
 
     /// Install durable raw contents without validating the blob's container header.
-    #[cfg(any(test, feature = "test-utils"))]
     pub fn set_raw_blob(&self, partition: &str, name: &[u8], content: Vec<u8>) {
         let key = (partition.to_string(), name.to_vec());
         let mut generations = self.generations.lock();
@@ -203,6 +200,37 @@ impl Storage {
             .entry(partition.into())
             .or_default()
             .insert(name.into(), content);
+    }
+
+    /// Whether handles opened from the blob's current incarnation can still publish into it.
+    pub(crate) fn is_current(&self, partition: &str, name: &[u8]) -> bool {
+        self.generations
+            .lock()
+            .current
+            .contains_key(&(partition.to_string(), name.to_vec()))
+    }
+
+    /// Apply `f` to a blob's durable logical contents (excluding its container header) and retire
+    /// its live generation, so no earlier handle or crash replay publishes over the change.
+    ///
+    /// Returns `None`, without retiring anything, when the blob is missing or its container
+    /// header does not resolve.
+    pub(crate) fn update_logical<R>(
+        &self,
+        partition: &str,
+        name: &[u8],
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Option<R> {
+        let key = (partition.to_string(), name.to_vec());
+        let mut generations = self.generations.lock();
+        let mut partitions = self.partitions.lock();
+        let content = partitions.get_mut(partition)?.get_mut(name)?;
+        let versions = BlobVersion::new(0)..=BlobVersion::new(u16::MAX);
+        let (_, _, data_offset) = resolve_header(content, &versions, partition, name).ok()??;
+        let data_offset = usize::try_from(data_offset).expect("header region fits in memory");
+        let result = f(&mut content[data_offset..]);
+        generations.current.remove(&key);
+        Some(result)
     }
 }
 
