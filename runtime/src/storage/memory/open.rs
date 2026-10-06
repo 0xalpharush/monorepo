@@ -83,6 +83,16 @@ impl Opens {
         Ok(replaced)
     }
 
+    /// Run `f` with whether a logical open of the blob is live, holding the registry so no open
+    /// or removal begins meanwhile.
+    pub(crate) fn inspect<R>(&self, partition: &str, name: &[u8], f: impl FnOnce(bool) -> R) -> R {
+        let opens = self.enter();
+        let live = opens
+            .get(&(partition.to_owned(), name.to_vec()))
+            .is_some_and(|identity| identity.strong_count() != 0);
+        f(live)
+    }
+
     /// Lock the registry.
     fn enter(&self) -> MutexGuard<'_, BTreeMap<Key, Weak<Live>>> {
         #[cfg(test)]
