@@ -45,8 +45,6 @@ where
         receiver: oneshot::Receiver<Result<T, Error>>,
         abort_handle: AbortHandle,
         metric: MetricHandle,
-        /// The supervision node the task is registered in.
-        tree: Arc<Tree>,
     },
     Completion {
         future: Abortable<Completion<T>>,
@@ -182,7 +180,7 @@ where
         // Install cleanup before the first poll so rejected tasks also close
         // supervision and finish their metrics when the future is dropped.
         let guard = TaskGuard {
-            tree: Arc::clone(&tree),
+            tree,
             metric: metric.clone(),
         };
 
@@ -220,7 +218,6 @@ where
                     receiver,
                     abort_handle,
                     metric,
-                    tree,
                 },
             },
         )
@@ -327,22 +324,14 @@ where
     }
 
     /// Abort the spawned task or stop waiting for a completion.
-    ///
-    /// Aborting a task also aborts every task in its supervision subtree before returning, so
-    /// none of them is polled again.
     pub fn abort(&self) {
         match &self.state {
             HandleState::Task {
                 abort_handle,
                 metric,
-                tree,
                 ..
             } => {
                 abort_handle.abort();
-
-                // Abort descendants now rather than when the aborted future is next dropped, so
-                // none of them can be polled after this returns.
-                tree.abort();
 
                 // We might never poll the future again after aborting it, so run the
                 // metric cleanup right away.
