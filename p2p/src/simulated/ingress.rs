@@ -10,6 +10,7 @@ use commonware_utils::{
     NZUsize, Probability,
     channel::{fallible::FallibleExt, mpsc, oneshot, ring},
     ordered::{Map, Set},
+    probability,
 };
 use rand_distr::Normal;
 use std::time::Duration;
@@ -62,6 +63,12 @@ pub enum Message<P: PublicKey, E: Clock> {
         receiver: P,
         result: oneshot::Sender<Result<(), Error>>,
     },
+    SetLinkFaults {
+        sender: P,
+        receiver: P,
+        faults: LinkFaults,
+        result: oneshot::Sender<Result<(), Error>>,
+    },
     Block {
         /// The public key of the peer sending the block request.
         from: P,
@@ -107,6 +114,10 @@ impl<P: PublicKey, E: Clock> std::fmt::Debug for Message<P, E> {
             Self::LimitBandwidth { .. } => f.debug_struct("LimitBandwidth").finish_non_exhaustive(),
             Self::AddLink { .. } => f.debug_struct("AddLink").finish_non_exhaustive(),
             Self::RemoveLink { .. } => f.debug_struct("RemoveLink").finish_non_exhaustive(),
+            Self::SetLinkFaults { faults, .. } => f
+                .debug_struct("SetLinkFaults")
+                .field("faults", faults)
+                .finish_non_exhaustive(),
             Self::Block { from, to } => f
                 .debug_struct("Block")
                 .field("from", from)
@@ -164,6 +175,60 @@ pub struct Link {
 
     /// Probability of a message being delivered successfully.
     pub success_rate: Probability,
+}
+
+/// Message faults injected on a link in addition to the drops, latency, and jitter of [Link].
+///
+/// Faults are only applied to messages that the link does not drop. Each fault is sampled from
+/// the network's RNG, and a fault with probability zero (the default) consumes no randomness, so
+/// a link without faults behaves exactly like one where faults were never configured.
+///
+/// # Duplication
+///
+/// With probability `duplicate_rate`, a second copy of the message is re-sent on the same path
+/// when the original copy's sampled latency elapses (approximately when it arrives). The copy
+/// draws its own latency from the path's latency distribution, is always delivered, and consumes
+/// bandwidth like any other message. Messages on a link remain FIFO, so the copy is delivered
+/// after any message sent on that path before it was re-sent (it can arrive after newer
+/// messages, as a stale replay). The copy is discarded if, when it is re-sent, its path no
+/// longer has a link, either peer is no longer tracked, or (with
+/// [`crate::simulated::Config::disconnect_on_block`]) either peer blocks the other.
+///
+/// # Misdirection
+///
+/// With probability `misdirect_rate`, a message sent from `A` to `B` is delivered to a different
+/// peer `C` instead of `B`. `C` still observes `A` as the sender (an authenticated transport
+/// attaches the identity of the connection the bytes arrived on). `C` is chosen uniformly at
+/// random from peers (in public key order) that are not `A` or `B`, are tracked, have
+/// registered the message's channel, have a link from `A`, and (with
+/// [`crate::simulated::Config::disconnect_on_block`]) are not blocked by or blocking `A`.
+/// Misdirection thus never crosses a partition modeled by removed links. If no such peer
+/// exists, the message is dropped.
+///
+/// A misdirected message keeps the latency sampled from the `A -> B` link, is charged to the
+/// egress of `A` and the ingress of `C`, and is ordered with other messages on the `A -> C`
+/// link. A duplicate of a misdirected message is also sent to `C`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkFaults {
+    /// Probability that a delivered message is delivered a second time.
+    pub duplicate_rate: Probability,
+
+    /// Probability that a delivered message is delivered to a different peer.
+    pub misdirect_rate: Probability,
+}
+
+impl LinkFaults {
+    /// No faults.
+    pub const NONE: Self = Self {
+        duplicate_rate: probability!(0.0),
+        misdirect_rate: probability!(0.0),
+    };
+}
+
+impl Default for LinkFaults {
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 /// Interface for modifying the simulated network.
@@ -293,6 +358,32 @@ impl<P: PublicKey, E: Clock> Oracle<P, E> {
         request(&self.sender, move |result| Message::RemoveLink {
             sender,
             receiver,
+            result,
+        })
+        .await
+        .ok_or(Error::NetworkClosed)?
+    }
+
+    /// Set the [LinkFaults] applied to messages on an existing unidirectional link.
+    ///
+    /// Faults apply to messages sent after the update. A newly added link has no faults, so
+    /// faults must be set again after a link is removed and re-added.
+    ///
+    /// If no link exists, this will return an error.
+    pub async fn set_link_faults(
+        &self,
+        sender: P,
+        receiver: P,
+        faults: LinkFaults,
+    ) -> Result<(), Error> {
+        if sender == receiver {
+            return Err(Error::LinkingSelf);
+        }
+
+        request(&self.sender, move |result| Message::SetLinkFaults {
+            sender,
+            receiver,
+            faults,
             result,
         })
         .await

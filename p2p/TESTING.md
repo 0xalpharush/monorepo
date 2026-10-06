@@ -34,6 +34,6 @@ oracle.add_link(pk1, pk2, Link {
 
 ## Adversarial scenarios
 
-Exercise partitions, latency, jitter, and loss when they affect the protocol. For Byzantine tests, substitute the relevant mock actor and verify the expected fault or block outcome.
+Exercise partitions, latency, jitter, and loss when they affect the protocol. Use `oracle.set_link_faults` with `LinkFaults` to duplicate (stale replays) or misdirect messages to other peers. For Byzantine tests, substitute the relevant mock actor and verify the expected fault or block outcome.
 
 Monitor progress with supervisors or metrics rather than time alone. Run a scenario twice with the same seed when its state is meant to be deterministic.
