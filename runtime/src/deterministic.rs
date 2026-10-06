@@ -42,13 +42,6 @@
 //! });
 //! ```
 
-pub use crate::network::deterministic::{
-    Delivery as NetworkDelivery, Link as NetworkLink, Policy as NetworkPolicy,
-};
-pub use crate::storage::faulty::{
-    Config as FaultConfig, Decision as FaultDecision, Draw as FaultDraw, Op as StorageOp,
-    PartialWriteMode, Policy as FaultPolicy, ResizeConfig, SharedRng, WriteConfig,
-};
 use crate::{
     BlobVersion, BufferPool, BufferPoolConfig, Clock, Error, Execution, Handle, IoBufs, ListenerOf,
     METRICS_PREFIX, Name, Panicked, child_label,
@@ -79,6 +72,15 @@ use crate::{
 };
 #[cfg(feature = "external")]
 use crate::{Blocker, Pacer};
+pub use crate::{
+    network::deterministic::{
+        Delivery as NetworkDelivery, Link as NetworkLink, Policy as NetworkPolicy,
+    },
+    storage::faulty::{
+        Config as FaultConfig, Decision as FaultDecision, Draw as FaultDraw, Op as StorageOp,
+        PartialWriteMode, Policy as FaultPolicy, ResizeConfig, SharedRng, WriteConfig,
+    },
+};
 use commonware_codec::Encode;
 use commonware_formatting::hex;
 use commonware_macros::select;
@@ -106,6 +108,7 @@ use std::{
     mem::{replace, take},
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
+    ops::Range,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     sync::{
@@ -224,6 +227,35 @@ impl Auditor {
     pub fn state(&self) -> String {
         let hash = self.digest.lock();
         hex(hash.as_ref())
+    }
+}
+
+/// Record a blob's identity unambiguously in an audit event.
+fn audit_blob(hasher: &mut AuditHasher, partition: &str, name: &[u8]) {
+    hasher.update((partition.len() as u64).to_be_bytes());
+    hasher.update(partition.as_bytes());
+    hasher.update((name.len() as u64).to_be_bytes());
+    hasher.update(name);
+}
+
+/// A blob's durable contents captured by [Context::snapshot_blob], restored with
+/// [Context::restore_blob] to simulate lost writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobSnapshot {
+    partition: String,
+    name: Vec<u8>,
+    raw: Vec<u8>,
+}
+
+impl BlobSnapshot {
+    /// The partition of the captured blob.
+    pub fn partition(&self) -> &str {
+        &self.partition
+    }
+
+    /// The name of the captured blob.
+    pub fn name(&self) -> &[u8] {
+        &self.name
     }
 }
 
@@ -1320,6 +1352,181 @@ impl Context {
             .inner()
             .inner()
             .logical_blob(partition, name)
+    }
+
+    /// Apply `f` to a blob's durable logical contents.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the blob is missing, its container header does not resolve, or a handle that
+    /// can still publish to it is open.
+    fn corrupt_durable<R>(
+        &self,
+        partition: &str,
+        name: &[u8],
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> R {
+        let memory = self.storage.inner().inner().inner();
+        self.opens.inspect(partition, name, |live| {
+            assert!(
+                !live || !memory.is_current(partition, name),
+                "blob {partition}/{} is open; crash its process before corrupting it",
+                hex(name)
+            );
+            memory
+                .update_logical(partition, name, f)
+                .unwrap_or_else(|| panic!("blob {partition}/{} has no durable contents", hex(name)))
+        })
+    }
+
+    /// Flip bit `bit` (bit `bit % 8` of byte `bit / 8`) of a blob's durable logical contents,
+    /// as a cosmic ray or media error would.
+    ///
+    /// Offsets exclude the runtime's blob container header. The corruption persists: the next
+    /// open reads it. Unsynchronized writes still awaiting a crash outcome are discarded. Use this
+    /// while the owning process is down (after [Process::crash]); handles opened before that
+    /// crash may still be alive, but they can no longer publish.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the blob is missing, `bit` is outside its logical contents, or a handle that
+    /// can still publish to it is open.
+    pub fn corrupt_bit(&self, partition: &str, name: &[u8], bit: u64) {
+        self.auditor().event(b"corrupt_bit", |hasher| {
+            audit_blob(hasher, partition, name);
+            hasher.update(bit.to_be_bytes());
+        });
+        self.corrupt_durable(partition, name, |content| {
+            let bits = (content.len() as u64).saturating_mul(8);
+            assert!(
+                bit < bits,
+                "bit {bit} is outside blob {partition}/{} ({bits} bits)",
+                hex(name)
+            );
+            content[(bit / 8) as usize] ^= 1 << (bit % 8);
+        });
+    }
+
+    /// Overwrite the durable logical contents of `target` starting at `offset` with the durable
+    /// bytes `range` of `source`, as a misdirected write would. `source` and `target` may be the
+    /// same blob, and the ranges may overlap.
+    ///
+    /// The target's length is unchanged. Offsets, preconditions, and persistence are as in
+    /// [Self::corrupt_bit]; only `target` must have no handle that can still publish.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either blob is missing, `range` is outside the source's logical contents, the
+    /// copied range does not fit within the target's logical contents, or a handle that can
+    /// still publish to `target` is open.
+    pub fn misdirect(
+        &self,
+        source: (&str, &[u8]),
+        range: Range<u64>,
+        target: (&str, &[u8]),
+        offset: u64,
+    ) {
+        self.auditor().event(b"misdirect", |hasher| {
+            audit_blob(hasher, source.0, source.1);
+            hasher.update(range.start.to_be_bytes());
+            hasher.update(range.end.to_be_bytes());
+            audit_blob(hasher, target.0, target.1);
+            hasher.update(offset.to_be_bytes());
+        });
+        let bytes = self
+            .storage
+            .inner()
+            .inner()
+            .inner()
+            .logical_blob(source.0, source.1)
+            .unwrap_or_else(|| {
+                panic!(
+                    "blob {}/{} has no durable contents",
+                    source.0,
+                    hex(source.1)
+                )
+            });
+        assert!(
+            range.start <= range.end && range.end <= bytes.len() as u64,
+            "range {range:?} is outside blob {}/{} ({} bytes)",
+            source.0,
+            hex(source.1),
+            bytes.len()
+        );
+        let bytes = &bytes[range.start as usize..range.end as usize];
+        self.corrupt_durable(target.0, target.1, |content| {
+            let end = offset
+                .checked_add(bytes.len() as u64)
+                .filter(|end| *end <= content.len() as u64)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} bytes at offset {offset} exceed blob {}/{} ({} bytes)",
+                        bytes.len(),
+                        target.0,
+                        hex(target.1),
+                        content.len()
+                    )
+                });
+            content[offset as usize..end as usize].copy_from_slice(bytes);
+        });
+    }
+
+    /// Capture a blob's durable contents (including its length and container header), which
+    /// [Self::restore_blob] reinstates to simulate lost writes.
+    ///
+    /// Only synchronized contents are captured; unsynchronized writes of open handles are not.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the blob is missing.
+    pub fn snapshot_blob(&self, partition: &str, name: &[u8]) -> BlobSnapshot {
+        self.auditor().event(b"snapshot_blob", |hasher| {
+            audit_blob(hasher, partition, name);
+        });
+        let raw = self
+            .storage
+            .inner()
+            .inner()
+            .inner()
+            .raw_blob(partition, name)
+            .unwrap_or_else(|| panic!("blob {partition}/{} is missing", hex(name)));
+        BlobSnapshot {
+            partition: partition.to_string(),
+            name: name.to_vec(),
+            raw,
+        }
+    }
+
+    /// Revert a blob's durable contents, including its length, to `snapshot`, as if every write
+    /// synchronized since the snapshot was lost. Recreates the blob if it was removed.
+    ///
+    /// Unsynchronized writes still awaiting a crash outcome are discarded. Use this while the
+    /// owning process is down (after [Process::crash]); handles opened before that crash may
+    /// still be alive, but they can no longer publish.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a handle that can still publish to the blob is open.
+    pub fn restore_blob(&self, snapshot: &BlobSnapshot) {
+        let BlobSnapshot {
+            partition,
+            name,
+            raw,
+        } = snapshot;
+        self.auditor().event(b"restore_blob", |hasher| {
+            audit_blob(hasher, partition, name);
+            hasher.update((raw.len() as u64).to_be_bytes());
+            hasher.update(raw);
+        });
+        let memory = self.storage.inner().inner().inner();
+        self.opens.inspect(partition, name, |live| {
+            assert!(
+                !live || !memory.is_current(partition, name),
+                "blob {partition}/{} is open; crash its process before restoring it",
+                hex(name)
+            );
+            memory.set_raw_blob(partition, name, raw.clone());
+        });
     }
 
     /// Access the storage fault configuration.
@@ -3315,7 +3522,10 @@ mod tests {
         deterministic::Runner::new(cfg).start(|ctx| async move {
             let refused = SocketAddr::from(([127, 0, 0, 1], 4000));
             let _refusing = ctx.bind(refused).await.unwrap();
-            assert!(matches!(ctx.dial(refused).await, Err(Error::ConnectionFailed)));
+            assert!(matches!(
+                ctx.dial(refused).await,
+                Err(Error::ConnectionFailed)
+            ));
 
             let address = SocketAddr::from(([127, 0, 0, 1], 4001));
             let mut listener = ctx.bind(address).await.unwrap();
@@ -3329,9 +3539,18 @@ mod tests {
             );
             sink.send(b"second".to_vec()).await.unwrap();
             assert_eq!(stream.recv(11).await.unwrap().coalesce(), b"firstsecond");
-            assert!(matches!(sink.send(b"third".to_vec()).await, Err(Error::Closed)));
-            assert!(matches!(sink.send(b"fourth".to_vec()).await, Err(Error::Closed)));
-            assert!(stream.recv(1).await.is_err(), "a reset closes the peer's stream");
+            assert!(matches!(
+                sink.send(b"third".to_vec()).await,
+                Err(Error::Closed)
+            ));
+            assert!(matches!(
+                sink.send(b"fourth".to_vec()).await,
+                Err(Error::Closed)
+            ));
+            assert!(
+                stream.recv(1).await.is_err(),
+                "a reset closes the peer's stream"
+            );
         });
     }
 
@@ -3369,7 +3588,10 @@ mod tests {
             let listener = ctx.bind(address).await.unwrap();
             assert!(matches!(ctx.bind(address).await, Err(Error::BindFailed)));
             drop(listener);
-            assert!(matches!(ctx.dial(address).await, Err(Error::ConnectionFailed)));
+            assert!(matches!(
+                ctx.dial(address).await,
+                Err(Error::ConnectionFailed)
+            ));
             let _rebound = ctx.bind(address).await.unwrap();
             ctx.dial(address).await.unwrap();
         });
@@ -3612,7 +3834,10 @@ mod tests {
             assert_eq!(read.coalesce(), b"durable");
             // Other partitions keep their live handles and unsynced writes.
             survivor.sync().await.unwrap();
-            assert_eq!(ctx.logical_blob("node1", b"other").as_deref(), Some(&b"live"[..]));
+            assert_eq!(
+                ctx.logical_blob("node1", b"other").as_deref(),
+                Some(&b"live"[..])
+            );
         });
     }
 
@@ -3854,5 +4079,267 @@ mod tests {
             let sum = strategy.fold(0..100u64, || 0u64, |acc, i| acc + i, |a, b| a + b);
             assert_eq!(sum, 4950);
         });
+    }
+
+    /// Open `name` in `partition`, write `data`, and sync it.
+    async fn write_synced(ctx: &Context, partition: &str, name: &[u8], data: &[u8]) {
+        let (blob, _) = ctx.open(partition, name).await.unwrap();
+        blob.write_at(0, data.to_vec(), WriteOptions::SYNC)
+            .await
+            .unwrap();
+    }
+
+    /// Reopen a blob and read all of its logical contents.
+    async fn read_all(ctx: &Context, partition: &str, name: &[u8]) -> Vec<u8> {
+        let (blob, len) = ctx.open(partition, name).await.unwrap();
+        blob.read_at(0, len as usize, ReadOptions::default())
+            .await
+            .unwrap()
+            .coalesce()
+            .as_ref()
+            .to_vec()
+    }
+
+    #[test]
+    fn test_corrupt_bit_persists_across_reopen() {
+        deterministic::Runner::default().start(|ctx| async move {
+            write_synced(&ctx, "node", b"blob", b"data").await;
+
+            // A crashed process's handle may still be alive, but it can no longer publish.
+            let (process_ctx, process) = ctx.process("node", |partition| partition == "node");
+            let (opened, opened_rx) = oneshot::channel();
+            let task = process_ctx.spawn(move |ctx| async move {
+                let (blob, _) = ctx.open("node", b"blob").await.unwrap();
+                blob.write_at(0, b"DATA".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+                let _ = opened.send(());
+                futures::future::pending::<()>().await;
+                drop(blob);
+            });
+            opened_rx.await.unwrap();
+            process.crash();
+
+            // Bit 10 is bit 2 of byte 1: 'a' (0x61) becomes 'e' (0x65).
+            ctx.corrupt_bit("node", b"blob", 10);
+            assert_eq!(
+                ctx.logical_blob("node", b"blob").as_deref(),
+                Some(&b"deta"[..])
+            );
+
+            // Reopening waits for the crashed task (and its handle) to be dropped.
+            assert!(task.await.is_err());
+            assert_eq!(read_all(&ctx, "node", b"blob").await, b"deta");
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "crash its process before corrupting it")]
+    fn test_corrupt_bit_rejects_open_handle() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let (blob, _) = ctx.open("node", b"blob").await.unwrap();
+            blob.write_at(0, b"data".to_vec(), WriteOptions::SYNC)
+                .await
+                .unwrap();
+            ctx.corrupt_bit("node", b"blob", 0);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "bit 32 is outside blob node/626c6f62 (32 bits)")]
+    fn test_corrupt_bit_rejects_out_of_range_bit() {
+        deterministic::Runner::default().start(|ctx| async move {
+            write_synced(&ctx, "node", b"blob", b"data").await;
+            ctx.corrupt_bit("node", b"blob", 32);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "has no durable contents")]
+    fn test_corrupt_bit_rejects_missing_blob() {
+        deterministic::Runner::default().start(|ctx| async move {
+            ctx.corrupt_bit("node", b"missing", 0);
+        });
+    }
+
+    #[test]
+    fn test_misdirect_copies_exactly_the_range() {
+        deterministic::Runner::default().start(|ctx| async move {
+            write_synced(&ctx, "node", b"a", b"abcdefgh").await;
+            write_synced(&ctx, "other", b"b", b"12345678").await;
+
+            ctx.misdirect(("node", b"a"), 2..5, ("other", b"b"), 1);
+            assert_eq!(read_all(&ctx, "other", b"b").await, b"1cde5678");
+            assert_eq!(read_all(&ctx, "node", b"a").await, b"abcdefgh");
+
+            // Overlapping ranges within one blob copy the original source bytes.
+            ctx.misdirect(("node", b"a"), 0..4, ("node", b"a"), 2);
+            assert_eq!(read_all(&ctx, "node", b"a").await, b"ababcdgh");
+
+            // An empty range changes nothing.
+            ctx.misdirect(("node", b"a"), 3..3, ("other", b"b"), 8);
+            assert_eq!(read_all(&ctx, "other", b"b").await, b"1cde5678");
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "4 bytes at offset 5 exceed blob other/62 (8 bytes)")]
+    fn test_misdirect_rejects_target_overflow() {
+        deterministic::Runner::default().start(|ctx| async move {
+            write_synced(&ctx, "node", b"a", b"abcdefgh").await;
+            write_synced(&ctx, "other", b"b", b"12345678").await;
+            ctx.misdirect(("node", b"a"), 0..4, ("other", b"b"), 5);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "range 6..9 is outside blob node/61 (8 bytes)")]
+    fn test_misdirect_rejects_source_overflow() {
+        deterministic::Runner::default().start(|ctx| async move {
+            write_synced(&ctx, "node", b"a", b"abcdefgh").await;
+            ctx.misdirect(("node", b"a"), 6..9, ("node", b"a"), 0);
+        });
+    }
+
+    #[test]
+    fn test_restore_blob_reverts_length_and_contents() {
+        deterministic::Runner::default().start(|ctx| async move {
+            write_synced(&ctx, "node", b"blob", b"short").await;
+            let snapshot = ctx.snapshot_blob("node", b"blob");
+            assert_eq!(snapshot.partition(), "node");
+            assert_eq!(snapshot.name(), b"blob");
+
+            {
+                let (blob, _) = ctx.open("node", b"blob").await.unwrap();
+                blob.write_at(0, b"SHORT and longer".to_vec(), WriteOptions::SYNC)
+                    .await
+                    .unwrap();
+            }
+            ctx.restore_blob(&snapshot);
+            assert_eq!(read_all(&ctx, "node", b"blob").await, b"short");
+
+            // A removed blob is recreated with its snapshotted contents.
+            ctx.remove("node", None).await.unwrap();
+            ctx.restore_blob(&snapshot);
+            assert_eq!(ctx.scan("node").await.unwrap(), vec![b"blob".to_vec()]);
+            assert_eq!(read_all(&ctx, "node", b"blob").await, b"short");
+        });
+    }
+
+    #[test]
+    fn test_restore_blob_discards_pending_crash_writes() {
+        let faults = FaultConfig::default().write(WriteConfig {
+            failure_rate: probability!(0.0),
+            retention_rate: probability!(1.0),
+            mode: PartialWriteMode::Prefix,
+        });
+        Runner::new(Config::default().with_storage_fault_config(faults)).start(|ctx| async move {
+            write_synced(&ctx, "node", b"blob", b"old").await;
+            let snapshot = ctx.snapshot_blob("node", b"blob");
+            let (process_ctx, process) = ctx.process("node", |partition| partition == "node");
+            {
+                let (blob, _) = process_ctx.open("node", b"blob").await.unwrap();
+                blob.write_at(0, b"new!".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+            }
+
+            // The unsynced write would survive the crash, but the restore discards it.
+            ctx.restore_blob(&snapshot);
+            process.crash();
+            assert_eq!(read_all(&ctx, "node", b"blob").await, b"old");
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "crash its process before restoring it")]
+    fn test_restore_blob_rejects_open_handle() {
+        deterministic::Runner::default().start(|ctx| async move {
+            write_synced(&ctx, "node", b"blob", b"data").await;
+            let snapshot = ctx.snapshot_blob("node", b"blob");
+            let _blob = ctx.open("node", b"blob").await.unwrap();
+            ctx.restore_blob(&snapshot);
+        });
+    }
+
+    #[test]
+    fn test_durable_corruption_is_audited_and_deterministic() {
+        fn run(bit: u64) -> (String, Digest) {
+            deterministic::Runner::seeded(7).start(|ctx| async move {
+                write_synced(&ctx, "node", b"a", b"abcdefgh").await;
+                write_synced(&ctx, "node", b"b", b"12345678").await;
+                let snapshot = ctx.snapshot_blob("node", b"b");
+                ctx.corrupt_bit("node", b"a", bit);
+                ctx.misdirect(("node", b"a"), 0..4, ("node", b"b"), 4);
+                ctx.restore_blob(&snapshot);
+                ctx.corrupt_bit("node", b"b", bit);
+                (ctx.auditor().state(), ctx.storage_audit())
+            })
+        }
+
+        assert_eq!(run(3), run(3));
+        let (state, audit) = run(3);
+        let (other_state, other_audit) = run(4);
+        assert_ne!(state, other_state);
+        assert_ne!(audit, other_audit);
+    }
+
+    /// Corrupts exactly the reads of one blob, flipping the highest bit drawn.
+    #[derive(Default)]
+    struct CorruptBlobReads {
+        #[allow(clippy::type_complexity)]
+        seen: Mutex<Vec<(Option<Vec<u8>>, StorageOp, FaultDraw)>>,
+    }
+
+    impl FaultPolicy for CorruptBlobReads {
+        fn occurs(&self, decision: &FaultDecision<'_>, _: commonware_utils::Probability) -> bool {
+            self.seen.lock().push((
+                decision.name.map(<[u8]>::to_vec),
+                decision.op,
+                decision.draw,
+            ));
+            decision.draw == FaultDraw::Corrupt && decision.name == Some(b"target")
+        }
+
+        fn between(&self, decision: &FaultDecision<'_>, range: std::ops::Range<u64>) -> u64 {
+            assert_eq!(decision.draw, FaultDraw::CorruptBit);
+            range.end - 1
+        }
+    }
+
+    #[test]
+    fn test_read_corruption_follows_policy() {
+        let policy = Arc::new(CorruptBlobReads::default());
+        let cfg = deterministic::Config::default()
+            .with_storage_fault_config(FaultConfig::default().corrupt_read(probability!(0.5)))
+            .with_storage_fault_policy(policy.clone());
+        deterministic::Runner::new(cfg).start(|ctx| async move {
+            for name in [&b"target"[..], b"healthy"] {
+                write_synced(&ctx, "node", name, b"data").await;
+            }
+            // The highest bit of the final byte flips: 'a' (0x61) becomes 0xe1.
+            assert_eq!(read_all(&ctx, "node", b"target").await, b"dat\xe1");
+            assert_eq!(read_all(&ctx, "node", b"healthy").await, b"data");
+            // Durable contents are unchanged.
+            assert_eq!(
+                ctx.logical_blob("node", b"target").as_deref(),
+                Some(&b"data"[..])
+            );
+        });
+        let seen = policy.seen.lock();
+        let reads: Vec<_> = seen
+            .iter()
+            .filter(|(_, op, _)| *op == StorageOp::Read)
+            .map(|(name, _, draw)| (name.as_deref(), *draw))
+            .collect();
+        assert_eq!(
+            reads,
+            [
+                (Some(&b"target"[..]), FaultDraw::Fail),
+                (Some(&b"target"[..]), FaultDraw::Corrupt),
+                (Some(&b"healthy"[..]), FaultDraw::Fail),
+                (Some(&b"healthy"[..]), FaultDraw::Corrupt),
+            ]
+        );
     }
 }
