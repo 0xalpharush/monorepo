@@ -5,6 +5,8 @@
 //! quality. Messages on a link are delivered in order, and optional per-peer bandwidth limits account for
 //! transmission delay and queueing.
 //!
+//! Links can also duplicate or misdirect messages (see [LinkFaults] and [Oracle::set_link_faults]).
+//!
 //! # Determinism
 //!
 //! `commonware-p2p::simulated` can be run deterministically when paired with `commonware-runtime::deterministic`.
@@ -172,7 +174,7 @@ pub enum Error {
     PeerMissing,
 }
 
-pub use ingress::{Control, Link, Manager, Oracle, SocketManager};
+pub use ingress::{Control, Link, LinkFaults, Manager, Oracle, SocketManager};
 pub use network::{
     Config, ConnectedPeerProvider, MAX_SIZE, Network, Receiver, Sender, SplitForwarder,
     SplitOrigin, SplitRouter, SplitSender, SplitTarget, UnlimitedSender,
@@ -206,7 +208,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, HashMap, HashSet},
         net::SocketAddr,
-        num::NonZeroU32,
+        num::{NonZeroU32, NonZeroUsize},
         time::Duration,
     };
 
@@ -3471,6 +3473,383 @@ mod tests {
             assert_eq!(update.index, 0);
             assert_eq!(update.latest.primary, peers);
             assert!(update.latest.secondary.is_empty());
+        });
+    }
+
+    /// Delivery observed by a peer: (receiver index, sender, payload, time).
+    type Delivery = (usize, PublicKey, IoBuf, std::time::SystemTime);
+
+    /// Starts a network of `size` tracked peers registered on channel 0 and returns their keys,
+    /// senders, and a log of every delivery.
+    async fn start_logged_network(
+        context: &deterministic::Context,
+        size: usize,
+    ) -> (
+        Oracle<PublicKey, deterministic::Context>,
+        Vec<PublicKey>,
+        Vec<network::Sender<PublicKey, deterministic::Context>>,
+        mpsc::UnboundedReceiver<Delivery>,
+    ) {
+        let (network, oracle) = Network::new(
+            context.child("network"),
+            Config {
+                max_size: 1024 * 1024,
+                max_peers_per_set: NonZeroUsize::new(size + 1).unwrap(),
+                disconnect_on_block: true,
+                tracked_peer_sets: NZUsize!(1),
+            },
+        );
+        network.start();
+
+        let (log_sender, log_receiver) = mpsc::unbounded_channel();
+        let mut keys = Vec::new();
+        let mut senders = Vec::new();
+        for i in 0..size {
+            let pk = PrivateKey::from_seed(i as u64).public_key();
+            let (sender, mut receiver) = oracle
+                .control(pk.clone())
+                .register(0, TEST_QUOTA)
+                .await
+                .unwrap();
+            let log = log_sender.clone();
+            context.child("receiver").spawn(move |context| async move {
+                while let Ok((origin, message)) = receiver.recv().await {
+                    let _ = log.send((i, origin, message, context.current()));
+                }
+            });
+            keys.push(pk);
+            senders.push(sender);
+        }
+        track_peers(&oracle, keys.iter().cloned()).await;
+        (oracle, keys, senders, log_receiver)
+    }
+
+    fn drain(log: &mut mpsc::UnboundedReceiver<Delivery>) -> Vec<Delivery> {
+        let mut deliveries = Vec::new();
+        while let Ok(delivery) = log.try_recv() {
+            deliveries.push(delivery);
+        }
+        deliveries
+    }
+
+    const FAULT_LINK: Link = Link {
+        latency: Duration::from_millis(50),
+        jitter: Duration::ZERO,
+        success_rate: probability!(1.0),
+    };
+
+    /// Runs random sends over a lossy mesh and returns the auditor state and all deliveries.
+    ///
+    /// When `faults` is `None`, faults are never configured.
+    fn simulate_faults(seed: u64, faults: Option<LinkFaults>) -> (String, Vec<Delivery>) {
+        let executor = deterministic::Runner::seeded(seed);
+        executor.start(|mut context| async move {
+            let size = 5;
+            let (oracle, keys, mut senders, mut log) = start_logged_network(&context, size).await;
+            for a in &keys {
+                for b in &keys {
+                    if a == b {
+                        continue;
+                    }
+                    let link = Link {
+                        latency: Duration::from_millis(10),
+                        jitter: Duration::from_millis(5),
+                        success_rate: probability!(0.9),
+                    };
+                    oracle.add_link(a.clone(), b.clone(), link).await.unwrap();
+                    match faults {
+                        Some(faults) => oracle
+                            .set_link_faults(a.clone(), b.clone(), faults)
+                            .await
+                            .unwrap(),
+                        // Issue an equivalent oracle round trip so task scheduling matches
+                        None => {
+                            oracle.blocked().await.unwrap();
+                        }
+                    }
+                }
+            }
+
+            for n in 0..200u32 {
+                let from = context.random_range(0..size);
+                let recipients = if context.random_range(0..2) == 0 {
+                    Recipients::All
+                } else {
+                    Recipients::One(keys[context.random_range(0..size)].clone())
+                };
+                senders[from].send(recipients, n.to_be_bytes().to_vec(), false);
+                context.sleep(Duration::from_millis(1)).await;
+            }
+            context.sleep(Duration::from_secs(1)).await;
+            (context.auditor().state(), drain(&mut log))
+        })
+    }
+
+    #[test]
+    fn test_link_faults_zero_rates_unchanged() {
+        for seed in 0..5 {
+            let unset = simulate_faults(seed, None);
+            let zero = simulate_faults(seed, Some(LinkFaults::NONE));
+            assert!(!unset.1.is_empty());
+            assert_eq!(unset, zero);
+        }
+    }
+
+    #[test]
+    fn test_link_faults_determinism() {
+        let faults = LinkFaults {
+            duplicate_rate: probability!(0.5),
+            misdirect_rate: probability!(0.25),
+        };
+        let mut outputs = Vec::new();
+        for seed in 0..5 {
+            let first = simulate_faults(seed, Some(faults));
+            assert_eq!(first, simulate_faults(seed, Some(faults)));
+            assert_ne!(first.1, simulate_faults(seed, None).1);
+            outputs.push(first);
+        }
+        assert_ne!(outputs[0], outputs[1]);
+    }
+
+    #[test]
+    fn test_link_faults_duplicate_all() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let (oracle, keys, mut senders, mut log) = start_logged_network(&context, 2).await;
+            oracle
+                .add_link(keys[0].clone(), keys[1].clone(), FAULT_LINK)
+                .await
+                .unwrap();
+            oracle
+                .set_link_faults(
+                    keys[0].clone(),
+                    keys[1].clone(),
+                    LinkFaults {
+                        duplicate_rate: probability!(1.0),
+                        ..LinkFaults::NONE
+                    },
+                )
+                .await
+                .unwrap();
+
+            // Send two messages 10ms apart
+            senders[0].send(Recipients::One(keys[1].clone()), b"first".to_vec(), false);
+            context.sleep(Duration::from_millis(10)).await;
+            senders[0].send(Recipients::One(keys[1].clone()), b"second".to_vec(), false);
+            context.sleep(Duration::from_secs(1)).await;
+
+            // Each copy is re-sent when the original arrives, so it lands after newer messages
+            let received: Vec<_> = drain(&mut log)
+                .into_iter()
+                .map(|(to, from, message, _)| {
+                    assert_eq!(to, 1);
+                    assert_eq!(from, keys[0]);
+                    message
+                })
+                .collect();
+            assert_eq!(
+                received,
+                vec![
+                    IoBuf::from(b"first"),
+                    IoBuf::from(b"second"),
+                    IoBuf::from(b"first"),
+                    IoBuf::from(b"second"),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn test_link_faults_duplicate_dropped_after_link_removed() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let (oracle, keys, mut senders, mut log) = start_logged_network(&context, 2).await;
+            oracle
+                .add_link(keys[0].clone(), keys[1].clone(), FAULT_LINK)
+                .await
+                .unwrap();
+            oracle
+                .set_link_faults(
+                    keys[0].clone(),
+                    keys[1].clone(),
+                    LinkFaults {
+                        duplicate_rate: probability!(1.0),
+                        ..LinkFaults::NONE
+                    },
+                )
+                .await
+                .unwrap();
+
+            // The original is already in flight when the link is removed, but the copy is
+            // re-sent after removal and is discarded
+            senders[0].send(Recipients::One(keys[1].clone()), b"only".to_vec(), false);
+            context.sleep(Duration::from_millis(49)).await;
+            oracle
+                .remove_link(keys[0].clone(), keys[1].clone())
+                .await
+                .unwrap();
+            context.sleep(Duration::from_secs(1)).await;
+            let deliveries = drain(&mut log);
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(deliveries[0].2, IoBuf::from(b"only"));
+        });
+    }
+
+    #[test]
+    fn test_link_faults_misdirect_all() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let (oracle, keys, mut senders, mut log) = start_logged_network(&context, 5).await;
+
+            // This peer only registers another channel, so it is never a target on channel 0
+            let other = PrivateKey::from_seed(100).public_key();
+            let (_, _other_receiver) = oracle
+                .control(other.clone())
+                .register(1, TEST_QUOTA)
+                .await
+                .unwrap();
+            let mut tracked = keys.clone();
+            tracked.push(other.clone());
+            let mut manager = oracle.manager();
+            manager.track(1, Set::from_iter_dedup(tracked));
+            assert!(manager.peer_set(1).await.is_some());
+
+            // Peer 3 has no link from peer 0, so it is never a target
+            for to in [1, 2, 4] {
+                oracle
+                    .add_link(keys[0].clone(), keys[to].clone(), FAULT_LINK)
+                    .await
+                    .unwrap();
+            }
+            oracle
+                .add_link(keys[0].clone(), other.clone(), FAULT_LINK)
+                .await
+                .unwrap();
+
+            // Peer 4 is blocked by peer 0, so it is never a target
+            crate::block_peer(&mut oracle.control(keys[0].clone()), keys[4].clone());
+            oracle
+                .set_link_faults(
+                    keys[0].clone(),
+                    keys[1].clone(),
+                    LinkFaults {
+                        misdirect_rate: probability!(1.0),
+                        ..LinkFaults::NONE
+                    },
+                )
+                .await
+                .unwrap();
+
+            for n in 0..20u32 {
+                senders[0].send(
+                    Recipients::One(keys[1].clone()),
+                    n.to_be_bytes().to_vec(),
+                    false,
+                );
+            }
+            context.sleep(Duration::from_secs(1)).await;
+
+            // Only peer 2 is eligible, and it observes peer 0 as the sender
+            let deliveries = drain(&mut log);
+            assert_eq!(deliveries.len(), 20);
+            for (n, (to, from, message, _)) in deliveries.into_iter().enumerate() {
+                assert_eq!(to, 2);
+                assert_eq!(from, keys[0]);
+                assert_eq!(message, IoBuf::from((n as u32).to_be_bytes().to_vec()));
+            }
+        });
+    }
+
+    #[test]
+    fn test_link_faults_misdirect_spreads_across_targets() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let (oracle, keys, mut senders, mut log) = start_logged_network(&context, 4).await;
+            for to in 1..4 {
+                oracle
+                    .add_link(keys[0].clone(), keys[to].clone(), FAULT_LINK)
+                    .await
+                    .unwrap();
+            }
+            oracle
+                .set_link_faults(
+                    keys[0].clone(),
+                    keys[1].clone(),
+                    LinkFaults {
+                        misdirect_rate: probability!(1.0),
+                        ..LinkFaults::NONE
+                    },
+                )
+                .await
+                .unwrap();
+
+            for n in 0..50u32 {
+                senders[0].send(
+                    Recipients::One(keys[1].clone()),
+                    n.to_be_bytes().to_vec(),
+                    false,
+                );
+            }
+            context.sleep(Duration::from_secs(1)).await;
+
+            let deliveries = drain(&mut log);
+            assert_eq!(deliveries.len(), 50);
+            let mut counts = [0usize; 4];
+            for (to, from, _, _) in deliveries {
+                assert_eq!(from, keys[0]);
+                counts[to] += 1;
+            }
+            assert_eq!(counts[0], 0);
+            assert_eq!(counts[1], 0);
+            assert!(counts[2] > 0);
+            assert!(counts[3] > 0);
+        });
+    }
+
+    #[test]
+    fn test_link_faults_misdirect_without_target_drops() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let (oracle, keys, mut senders, mut log) = start_logged_network(&context, 2).await;
+            oracle
+                .add_link(keys[0].clone(), keys[1].clone(), FAULT_LINK)
+                .await
+                .unwrap();
+            oracle
+                .set_link_faults(
+                    keys[0].clone(),
+                    keys[1].clone(),
+                    LinkFaults {
+                        duplicate_rate: probability!(1.0),
+                        misdirect_rate: probability!(1.0),
+                    },
+                )
+                .await
+                .unwrap();
+
+            senders[0].send(Recipients::One(keys[1].clone()), b"lost".to_vec(), false);
+            context.sleep(Duration::from_secs(1)).await;
+            assert!(drain(&mut log).is_empty());
+        });
+    }
+
+    #[test]
+    fn test_link_faults_missing_link() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let (oracle, keys, _, _) = start_logged_network(&context, 2).await;
+            assert!(matches!(
+                oracle
+                    .set_link_faults(keys[0].clone(), keys[1].clone(), LinkFaults::NONE)
+                    .await,
+                Err(Error::LinkMissing)
+            ));
+            assert!(matches!(
+                oracle
+                    .set_link_faults(keys[0].clone(), keys[0].clone(), LinkFaults::NONE)
+                    .await,
+                Err(Error::LinkingSelf)
+            ));
         });
     }
 }

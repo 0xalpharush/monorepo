@@ -2,7 +2,7 @@
 
 use super::{
     Error,
-    ingress::{self, Oracle},
+    ingress::{self, LinkFaults, Oracle},
     metrics,
     transmitter::{self, Completion},
 };
@@ -32,7 +32,7 @@ use commonware_utils::{
 };
 use either::Either;
 use futures::{Sink, future};
-use rand::Rng;
+use rand::{Rng, RngExt as _};
 use rand_distr::{Distribution, Normal};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -53,6 +53,15 @@ type PeerSetsAtIndex<P> = PeerSetsAtIndexBase<Set<P>, Set<P>>;
 
 /// Task type representing a message to be sent within the network.
 type Task<P> = (Channel, P, Recipients<P>, IoBuf);
+
+/// Duplicate copy of a message waiting to be re-sent on a link.
+struct Replay<P> {
+    channel: Channel,
+    origin: P,
+    recipient: P,
+    message: IoBuf,
+    latency: Duration,
+}
 
 /// Overhead from prepending a channel identifier to an application payload.
 const MAX_PAYLOAD_OVERHEAD: u32 = Channel::SIZE as u32;
@@ -197,6 +206,12 @@ pub struct Network<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> 
     // State of the transmitter
     transmitter: transmitter::State<P>,
 
+    // Duplicate messages keyed by (re-send time, insertion sequence)
+    replays: BTreeMap<(SystemTime, u64), Replay<P>>,
+
+    // Sequence used to order replays scheduled for the same time
+    next_replay: u64,
+
     // Subscribers to primary peer set updates (used by `Manager::subscribe`).
     subscribers: Vec<mpsc::UnboundedSender<PeerSetUpdate<P>>>,
 
@@ -248,6 +263,8 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
                 peer_ref_counts: BTreeMap::new(),
                 blocks: BTreeSet::new(),
                 transmitter: transmitter::State::new(),
+                replays: BTreeMap::new(),
+                next_replay: 0,
                 subscribers: Vec::new(),
                 peer_subscribers: Vec::new(),
                 blocked_subscribers: Vec::new(),
@@ -508,6 +525,7 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
                     Ok(receiver) => Receiver { receiver },
                     Err(err) => return send_result(result, Err(err)),
                 };
+                peer.channels.insert(channel);
 
                 send_result(result, Ok((sender, receiver)))
             }
@@ -592,6 +610,18 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
                     Some(_) => (),
                     None => return send_result(result, Err(Error::LinkMissing)),
                 }
+                send_result(result, Ok(()))
+            }
+            ingress::Message::SetLinkFaults {
+                sender,
+                receiver,
+                faults,
+                result,
+            } => {
+                let Some(link) = self.links.get_mut(&(sender, receiver)) else {
+                    return send_result(result, Err(Error::LinkMissing));
+                };
+                link.faults = faults;
                 send_result(result, Ok(()))
             }
             ingress::Message::Block { from, to } => {
@@ -745,6 +775,73 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
         self.peer_ref_counts.contains_key(peer)
     }
 
+    /// Returns whether messages between two peers are dropped because either blocks the other.
+    fn is_blocked(&self, a: &P, b: &P) -> bool {
+        self.disconnect_on_block
+            && (self.blocks.contains(&(a.clone(), b.clone()))
+                || self.blocks.contains(&(b.clone(), a.clone())))
+    }
+
+    /// Selects the peer that receives a message from `origin` misdirected away from `recipient`.
+    ///
+    /// See [LinkFaults] for the eligibility rules. Consumes randomness only when more than one
+    /// peer is eligible.
+    fn misdirect_target(&mut self, channel: Channel, origin: &P, recipient: &P) -> Option<P> {
+        let mut candidates: Vec<P> = self
+            .peers
+            .iter()
+            .filter(|(peer, state)| {
+                *peer != origin
+                    && *peer != recipient
+                    && state.channels.contains(&channel)
+                    && self.is_connectable(peer)
+                    && !self.is_blocked(origin, peer)
+                    && self.links.contains_key(&(origin.clone(), (*peer).clone()))
+            })
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        match candidates.len() {
+            0 => None,
+            1 => candidates.pop(),
+            len => {
+                let index = self.context.as_mut().random_range(0..len);
+                Some(candidates.swap_remove(index))
+            }
+        }
+    }
+
+    /// Re-send duplicate messages whose re-send time has been reached.
+    fn process_replays(&mut self) {
+        let now = self.context.current();
+        while let Some(entry) = self.replays.first_entry() {
+            if entry.key().0 > now {
+                break;
+            }
+            let replay = entry.remove();
+            let Replay {
+                channel,
+                origin,
+                recipient,
+                message,
+                latency,
+            } = replay;
+            if !self.is_connectable(&origin)
+                || !self.is_connectable(&recipient)
+                || self.is_blocked(&origin, &recipient)
+                || !self
+                    .links
+                    .contains_key(&(origin.clone(), recipient.clone()))
+            {
+                trace!(?origin, ?recipient, "dropping duplicate message");
+                continue;
+            }
+            let completions = self
+                .transmitter
+                .enqueue(now, origin, recipient, channel, message, latency, true);
+            self.process_completions(completions);
+        }
+    }
+
     /// Process completions from the transmitter.
     fn process_completions(&mut self, completions: Vec<Completion<P>>) {
         for completion in completions {
@@ -819,14 +916,11 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
             }
 
             // Determine if the sender or recipient has blocked the other
-            let o_r = (origin.clone(), recipient.clone());
-            let r_o = (recipient.clone(), origin.clone());
-            if self.disconnect_on_block
-                && (self.blocks.contains(&o_r) || self.blocks.contains(&r_o))
-            {
+            if self.is_blocked(&origin, &recipient) {
                 trace!(?origin, ?recipient, reason = "blocked", "dropping message");
                 continue;
             }
+            let o_r = (origin.clone(), recipient.clone());
 
             // Determine if there is a link between the origin and recipient
             let Some(link) = self.links.get_mut(&o_r) else {
@@ -847,13 +941,53 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
             let latency = Duration::from_millis(link.sampler.sample(self.context.as_mut()) as u64);
 
             // Determine if the message should be delivered
-            let should_deliver = link.success_rate.sample(self.context.as_mut());
+            let mut should_deliver = link.success_rate.sample(self.context.as_mut());
+            let faults = link.faults;
+
+            // Determine if the message should be delivered to a different peer
+            let mut destination = recipient;
+            if should_deliver && faults.misdirect_rate.sample(self.context.as_mut()) {
+                match self.misdirect_target(channel, &origin, &destination) {
+                    Some(target) => {
+                        trace!(?origin, intended = ?destination, ?target, "misdirecting message");
+                        destination = target;
+                    }
+                    None => {
+                        trace!(?origin, recipient = ?destination, "no misdirect target, dropping message");
+                        should_deliver = false;
+                    }
+                }
+            }
+
+            // Determine if the message should be re-sent once the original arrives
+            if should_deliver && faults.duplicate_rate.sample(self.context.as_mut()) {
+                let path = self
+                    .links
+                    .get(&(origin.clone(), destination.clone()))
+                    .expect("destination must have a link");
+                let replay_latency =
+                    Duration::from_millis(path.sampler.sample(self.context.as_mut()) as u64);
+                let at = now
+                    .checked_add(latency)
+                    .expect("latency overflow computing replay time");
+                self.replays.insert(
+                    (at, self.next_replay),
+                    Replay {
+                        channel,
+                        origin: origin.clone(),
+                        recipient: destination.clone(),
+                        message: message.clone(),
+                        latency: replay_latency,
+                    },
+                );
+                self.next_replay += 1;
+            }
 
             // Enqueue message for delivery
             let completions = self.transmitter.enqueue(
                 now,
                 origin.clone(),
-                recipient.clone(),
+                destination,
                 channel,
                 message.clone(),
                 latency,
@@ -937,12 +1071,19 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
                     Some(when) => Either::Left(self.context.sleep_until(when)),
                     None => Either::Right(future::pending()),
                 };
+                let replay = match self.replays.first_key_value() {
+                    Some(((when, _), _)) => Either::Left(self.context.sleep_until(*when)),
+                    None => Either::Right(future::pending()),
+                };
             },
             on_stopped => {},
             _ = tick => {
                 let now = self.context.current();
                 let completions = self.transmitter.advance(now);
                 self.process_completions(completions);
+            },
+            _ = replay => {
+                self.process_replays();
             },
             Some(message) = self.ingress.recv() else break => {
                 self.handle_ordered_ingress(message, &mut high, &mut low)
@@ -1311,6 +1452,9 @@ struct Peer<P: PublicKey> {
 
     // Control to register new channels
     control: mpsc::UnboundedSender<ChannelRegistration<P>>,
+
+    // Channels the peer has registered
+    channels: BTreeSet<Channel>,
 }
 
 impl<P: PublicKey> Peer<P> {
@@ -1427,6 +1571,7 @@ impl<P: PublicKey> Peer<P> {
         Self {
             socket,
             control: control_sender,
+            channels: BTreeSet::new(),
         }
     }
 
@@ -1452,6 +1597,7 @@ impl<P: PublicKey> Peer<P> {
 struct Link {
     sampler: Normal<f64>,
     success_rate: Probability,
+    faults: LinkFaults,
     // Messages with their receive time for ordered delivery
     inbox: mpsc::UnboundedSender<(Channel, IoBuf, SystemTime)>,
 }
@@ -1503,6 +1649,7 @@ impl Link {
         Self {
             sampler,
             success_rate,
+            faults: LinkFaults::NONE,
             inbox,
         }
     }
