@@ -202,21 +202,6 @@ pub struct Link {
 /// longer has a link, either peer is no longer tracked, or (with
 /// [`crate::simulated::Config::disconnect_on_block`]) either peer blocks the other.
 ///
-/// # Misdirection
-///
-/// With probability `misdirect_rate`, a message sent from `A` to `B` is delivered to a different
-/// peer `C` instead of `B`. `C` still observes `A` as the sender (an authenticated transport
-/// attaches the identity of the connection the bytes arrived on). `C` is chosen uniformly at
-/// random from peers (in public key order) that are not `A` or `B`, are tracked, have
-/// registered the message's channel, have a link from `A`, and (with
-/// [`crate::simulated::Config::disconnect_on_block`]) are not blocked by or blocking `A`.
-/// Misdirection thus never crosses a partition modeled by removed links. If no such peer
-/// exists, the message is dropped.
-///
-/// A misdirected message keeps the latency sampled from the `A -> B` link, is charged to the
-/// egress of `A` and the ingress of `C`, and is ordered with other messages on the `A -> C`
-/// link. A duplicate of a misdirected message is also sent to `C`.
-///
 /// # Corruption
 ///
 /// With probability `corrupt_rate`, one uniformly chosen bit of a delivered message is flipped.
@@ -231,16 +216,12 @@ pub struct LinkFaults {
 
     /// Probability that one bit of a delivered message is flipped.
     pub corrupt_rate: Probability,
-
-    /// Probability that a delivered message is delivered to a different peer.
-    pub misdirect_rate: Probability,
 }
 
 impl LinkFaults {
     /// No faults.
     pub const NONE: Self = Self {
         duplicate_rate: probability!(0.0),
-        misdirect_rate: probability!(0.0),
         corrupt_rate: probability!(0.0),
     };
 }

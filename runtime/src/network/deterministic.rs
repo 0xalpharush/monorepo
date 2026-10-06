@@ -38,8 +38,8 @@ pub struct Transmission<'a, A = SocketAddr> {
 
 /// What a simulated network does with one transmission.
 ///
-/// Built from [Self::after], [Self::DROP], or [Self::RESET], and refined with [Self::duplicated],
-/// [Self::corrupted], and [Self::misdirected]. Every network carries out every outcome in its own
+/// Built from [Self::after], [Self::DROP], or [Self::RESET], and refined with [Self::duplicated]
+/// and [Self::corrupted]. Every network carries out every outcome in its own
 /// unit (bytes on a connection, messages between peers); an outcome a network cannot express maps
 /// to the closest one it can, as each network documents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,8 +52,6 @@ pub struct Delivery {
     pub duplicate: Option<Duration>,
     /// Flip this bit of the transmission (modulo its length in bits) before delivering it.
     pub corrupt: Option<u64>,
-    /// Deliver to an endpoint other than the intended one.
-    pub misdirect: bool,
 }
 
 /// Whether, and how, a simulated network carries a transmission.
@@ -83,7 +81,6 @@ impl Delivery {
             after: Duration::ZERO,
             duplicate: None,
             corrupt: None,
-            misdirect: false,
         }
     }
 
@@ -104,12 +101,6 @@ impl Delivery {
     /// Flip `bit` (modulo the transmission's length in bits) before delivering.
     pub const fn corrupted(mut self, bit: u64) -> Self {
         self.corrupt = Some(bit);
-        self
-    }
-
-    /// Deliver to an endpoint other than the intended one.
-    pub const fn misdirected(mut self) -> Self {
-        self.misdirect = true;
         self
     }
 }
@@ -198,8 +189,8 @@ fn flip(bufs: IoBufs, bit: u64) -> IoBufs {
 /// Carries out [Delivery] outcomes on a byte stream:
 ///
 /// - `after` delays the send, holding back the sends behind it, as on a TCP stream.
-/// - [Fate::Drop], [Fate::Reset], and `misdirect` reset the connection before the send: a stream
-///   cannot lose or redirect bytes without breaking, and the peer's stream fails too.
+/// - [Fate::Drop] and [Fate::Reset] reset the connection before the send: a stream cannot lose
+///   bytes without breaking, and the peer's stream fails too.
 /// - `corrupt` flips a bit of the sent bytes.
 /// - `duplicate` sends the bytes again (after the extra delay), as a retransmission bug would.
 impl crate::Sink for Sink {
@@ -218,7 +209,7 @@ impl crate::Sink for Sink {
                 index,
                 len: bytes::Buf::remaining(&bufs),
             });
-            if delivery.fate != Fate::Deliver || delivery.misdirect {
+            if delivery.fate != Fate::Deliver {
                 // Dropping the sink closes the pipe, so the peer's stream fails too.
                 self.inner = None;
                 return Err(Error::Closed);
