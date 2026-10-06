@@ -796,7 +796,11 @@ impl Runner {
                     };
 
                     // Hold back the tasks of paused processes until they resume
-                    if task.process.as_ref().is_some_and(|process| process.paused()) {
+                    if task
+                        .process
+                        .as_ref()
+                        .is_some_and(|process| process.paused())
+                    {
                         trace!(id, "parking task of paused process");
                         executor.parked.lock().push(id);
                         continue;
@@ -1828,9 +1832,8 @@ impl ProcessState {
 
 /// Shifts `time` by a signed number of nanoseconds.
 fn shift(time: SystemTime, nanos: i128) -> SystemTime {
-    let magnitude = Duration::from_nanos(
-        u64::try_from(nanos.unsigned_abs()).expect("clock offset overflow"),
-    );
+    let magnitude =
+        Duration::from_nanos(u64::try_from(nanos.unsigned_abs()).expect("clock offset overflow"));
     if nanos >= 0 {
         time.checked_add(magnitude)
     } else {
@@ -3688,7 +3691,10 @@ mod tests {
                 ctx.sleep(Duration::from_millis(50)).await;
                 assert_eq!(ticks.load(Ordering::SeqCst), frozen, "paused tasks ran");
                 assert!(received.lock().is_empty(), "paused task received a message");
-                assert!(peer_ticks.load(Ordering::SeqCst) >= peer_before + 45, "peer stalled");
+                assert!(
+                    peer_ticks.load(Ordering::SeqCst) >= peer_before + 45,
+                    "peer stalled"
+                );
 
                 process.resume();
                 ctx.sleep(Duration::from_millis(5)).await;
@@ -3697,7 +3703,10 @@ mod tests {
                 assert_eq!(received.len(), 1);
                 assert!(received[0].1 >= paused_at + Duration::from_millis(50));
                 ctx.sleep(Duration::from_millis(10)).await;
-                assert!(ticks.load(Ordering::SeqCst) > frozen + 5, "resumed tasks did not run");
+                assert!(
+                    ticks.load(Ordering::SeqCst) > frozen + 5,
+                    "resumed tasks did not run"
+                );
             });
         }
     }
@@ -3765,7 +3774,10 @@ mod tests {
             let ahead = process_ctx.current();
             process.set_clock_offset(ClockOffset::Behind(Duration::from_secs(5)));
             assert!(process_ctx.current() < ahead);
-            assert_eq!(process_ctx.current(), ctx.current() - Duration::from_secs(5));
+            assert_eq!(
+                process_ctx.current(),
+                ctx.current() - Duration::from_secs(5)
+            );
 
             // Nested processes add their offsets.
             let (inner_ctx, inner) = process_ctx.process("inner", |_| false);
