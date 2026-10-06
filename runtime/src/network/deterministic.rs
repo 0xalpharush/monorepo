@@ -22,7 +22,7 @@ pub struct Link {
     pub to: SocketAddr,
 }
 
-/// What a deterministic [Network] does with one send.
+/// What a deterministic network does with one send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delivery {
     /// The bytes reach the peer after this much simulated time. The connection carries sends in
@@ -32,7 +32,7 @@ pub enum Delivery {
     Reset,
 }
 
-/// Decides the connection faults and latency of a deterministic [Network].
+/// Decides the connection faults and latency of a deterministic network.
 ///
 /// Connections otherwise behave as lossless, ordered, zero-latency pipes. A policy sees every
 /// dial and every send with the connection it concerns, so it can derive, record, replay, or

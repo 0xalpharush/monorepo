@@ -259,6 +259,20 @@ impl BlobSnapshot {
     }
 }
 
+mod scheduling;
+pub use scheduling::{DelayBounded, Pausing, Pct, RandomWalk};
+
+/// Tasks held back by a [SchedulingPolicy].
+#[derive(Default)]
+struct Held {
+    /// When each held task is released.
+    until: BTreeMap<u128, SystemTime>,
+    /// Held tasks in release order.
+    releases: BTreeSet<(SystemTime, u128)>,
+    /// Released tasks to poll once without consulting the policy.
+    released: BTreeSet<u128>,
+}
+
 /// A dynamic RNG that can safely be sent between threads.
 pub type BoxDynRng = Box<dyn CryptoRng + Send + 'static>;
 
@@ -286,11 +300,24 @@ impl RunnableTask {
     }
 }
 
-/// Controls cooperative polling order, not native-thread preemption.
-/// A policy must only permute the batch; it cannot add, remove, or modify tasks.
+/// Controls cooperative polling order and task pauses, not native-thread preemption.
+///
+/// Each iteration of the event loop polls a batch of runnable tasks. A policy permutes the batch
+/// ([Self::order]) and may hold individual tasks back for some virtual time ([Self::hold]), as
+/// if their threads were descheduled. A policy cannot add, remove, or modify tasks.
 pub trait SchedulingPolicy: Send + 'static {
     /// Reorders the current runnable batch at this virtual time.
     fn order(&mut self, time: SystemTime, ready: &mut [RunnableTask]);
+
+    /// How long to hold `task` back instead of polling it in the current (ordered) batch.
+    ///
+    /// A held task is not polled until the hold elapses, even if it is woken in the meantime;
+    /// it is then polled once without consulting this method. Other tasks and time keep
+    /// moving. Returning [Duration::ZERO] (the default) polls the task now.
+    fn hold(&mut self, time: SystemTime, task: &RunnableTask) -> Duration {
+        let _ = (time, task);
+        Duration::ZERO
+    }
 }
 
 type BoxDynSchedulingPolicy = Box<dyn SchedulingPolicy>;
@@ -518,6 +545,8 @@ pub struct Executor {
     parked: Mutex<Vec<u128>>,
     /// Live simulated processes, in start order.
     processes: Mutex<Vec<Arc<ProcessHost>>>,
+    /// Tasks held back by the scheduling policy, and when each is released.
+    held: Mutex<Held>,
     shutdown: Mutex<Stopper>,
     panicker: Panicker,
     dns: Mutex<HashMap<String, Vec<IpAddr>>>,
@@ -551,7 +580,8 @@ impl Executor {
             .map(|task| (task.id, task.occurrence))
             .collect();
         before.sort_unstable();
-        policy.lock().order(current, &mut ready);
+        let mut policy = policy.lock();
+        policy.order(current, &mut ready);
         let mut after: Vec<_> = ready
             .iter()
             .map(|task| (task.id, task.occurrence))
@@ -561,7 +591,33 @@ impl Executor {
             before, after,
             "scheduling policy changed the runnable batch"
         );
-        *queue = ready.into_iter().map(|task| task.id).collect();
+
+        // Hold back the tasks the policy pauses; a released task is polled without asking
+        let mut held = self.held.lock();
+        queue.clear();
+        for task in ready {
+            if held.released.remove(&task.id) {
+                queue.push(task.id);
+                continue;
+            }
+            if held.until.contains_key(&task.id) {
+                continue;
+            }
+            let hold = policy.hold(current, &task);
+            if hold.is_zero() {
+                queue.push(task.id);
+                continue;
+            }
+            let until = current
+                .checked_add(hold)
+                .expect("overflow when holding task");
+            self.auditor.event(b"hold_task", |hasher| {
+                hasher.update(task.id.to_be_bytes());
+                hasher.update(hold.as_nanos().to_be_bytes());
+            });
+            held.until.insert(task.id, until);
+            held.releases.insert((until, task.id));
+        }
     }
 
     /// Crash `host` unless it already crashed.
@@ -622,15 +678,19 @@ impl Executor {
             return current;
         }
 
-        let mut skip_until = None;
-        {
-            let sleeping = self.sleeping.lock();
-            if let Some(next) = sleeping.peek()
-                && next.time > current
-            {
-                skip_until = Some(next.time);
-            }
-        }
+        // The next alarm or held-task release, unless one is already due
+        let next_alarm = self.sleeping.lock().peek().map(|alarm| alarm.time);
+        let next_release = self
+            .held
+            .lock()
+            .releases
+            .first()
+            .map(|(release, _)| *release);
+        let next = match (next_alarm, next_release) {
+            (Some(alarm), Some(release)) => Some(alarm.min(release)),
+            (next, None) | (None, next) => next,
+        };
+        let skip_until = next.filter(|next| *next > current);
 
         skip_until.map_or(current, |deadline| {
             let mut time = self.time.lock();
@@ -639,6 +699,22 @@ impl Executor {
             trace!(now = now.epoch_millis(), "time skipped");
             now
         })
+    }
+
+    /// Requeue every held task whose hold has elapsed.
+    fn release_held(&self, current: SystemTime) {
+        let mut held = self.held.lock();
+        while let Some(&(release, id)) = held.releases.first() {
+            if release > current {
+                break;
+            }
+            held.releases.pop_first();
+            held.until.remove(&id);
+            if self.tasks.get(id).is_some() {
+                held.released.insert(id);
+                self.tasks.queue(id);
+            }
+        }
     }
 
     /// Wake any sleepers whose deadlines have elapsed.
@@ -667,13 +743,14 @@ impl Executor {
             current = self.skip_idle_time(current);
             self.assert_deadline(current);
             self.wake_ready_sleepers(current);
+            self.release_held(current);
 
             // Continue once external work or a woken task can make progress. Without either,
-            // another alarm is the runtime's only remaining source of progress.
+            // another alarm or held task is the runtime's only remaining source of progress.
             if cfg!(feature = "external") || self.tasks.ready() != 0 {
                 return;
             }
-            if self.sleeping.lock().is_empty() {
+            if self.sleeping.lock().is_empty() && self.held.lock().releases.is_empty() {
                 panic!("runtime stalled");
             }
         }
@@ -1232,6 +1309,7 @@ impl Context {
             sleeping: Mutex::new(BinaryHeap::new()),
             parked: Mutex::new(Vec::new()),
             processes: Mutex::new(Vec::new()),
+            held: Mutex::new(Held::default()),
             shutdown: Mutex::new(Stopper::default()),
             panicker,
             dns: Mutex::new(HashMap::new()),
@@ -1322,6 +1400,7 @@ impl Context {
             sleeping: Mutex::new(BinaryHeap::new()),
             parked: Mutex::new(Vec::new()),
             processes: Mutex::new(Vec::new()),
+            held: Mutex::new(Held::default()),
             shutdown: Mutex::new(Stopper::default()),
             panicker,
         });
@@ -4030,6 +4109,35 @@ mod tests {
             assert!(process.crashed());
             let (_, len) = ctx.open("node", b"journal").await.unwrap();
             assert_eq!(len, 7);
+        });
+    }
+
+    #[test]
+    fn test_crash_in_storage_stalls_the_process_other_operations() {
+        // Decisions: the writes to `a` and `b`, then the crashing sync of `a`.
+        deterministic::Runner::new(crash_config(CrashAt::new(2, 0))).start(|ctx| async move {
+            let (node, process) = ctx.process("node", |partition| partition == "node");
+            let other = Arc::new(Mutex::new(None));
+            let observed = other.clone();
+            let writer = node.spawn(move |ctx| async move {
+                let (a, _) = ctx.open("node", b"a").await.unwrap();
+                let (b, _) = ctx.open("node", b"b").await.unwrap();
+                a.write_at(0, b"a".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+                b.write_at(0, b"b".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+                let b_sync = async {
+                    let result = b.sync().await;
+                    *observed.lock() = Some(result.is_ok());
+                };
+                let _ = futures::join!(a.sync(), b_sync);
+            });
+            assert!(writer.await.is_err());
+            assert!(process.crashed());
+            // The sibling operation neither succeeded nor failed: it never completed.
+            assert_eq!(*other.lock(), None);
         });
     }
 

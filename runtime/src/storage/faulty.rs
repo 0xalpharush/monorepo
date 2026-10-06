@@ -17,7 +17,7 @@ use std::{
     ops::Range,
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -377,6 +377,9 @@ type FileKey = (String, Vec<u8>);
 struct FileGeneration {
     file: FileKey,
     mutation: AsyncMutex<()>,
+    /// Set once a crash retires the generation. Operations through a crashed generation never
+    /// complete, as on a host that lost power mid-call.
+    crashed: AtomicBool,
 }
 
 impl FileGeneration {
@@ -384,7 +387,12 @@ impl FileGeneration {
         Self {
             file,
             mutation: AsyncMutex::new(()),
+            crashed: AtomicBool::new(false),
         }
+    }
+
+    fn crashed(&self) -> bool {
+        self.crashed.load(Ordering::Relaxed)
     }
 
     fn decision(&self, op: Op, draw: Draw) -> Decision<'_> {
@@ -801,7 +809,15 @@ impl Storage<crate::storage::memory::Storage> {
         // Retire only after replay: replay publishes through the crashed generations.
         self.generations
             .lock()
-            .retain(|(partition, _), _| !affected(partition));
+            .retain(|(partition, _), generation| {
+                if !affected(partition) {
+                    return true;
+                }
+                if let Some(generation) = generation.upgrade() {
+                    generation.crashed.store(true, Ordering::Relaxed);
+                }
+                false
+            });
         self.inner.retire_partitions(&affected);
         Ok(())
     }
@@ -1026,6 +1042,9 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         len: usize,
         options: ReadOptions,
     ) -> Result<IoBufsMut, Error> {
+        if self.generation.crashed() {
+            return futures::future::pending().await;
+        }
         if self
             .ctx
             .should_fail(&self.generation.decision(Op::Read, Draw::Fail))
@@ -1044,6 +1063,9 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         bufs: impl Into<IoBufsMut> + Send,
         options: ReadOptions,
     ) -> Result<IoBufsMut, Error> {
+        if self.generation.crashed() {
+            return futures::future::pending().await;
+        }
         if self
             .ctx
             .should_fail(&self.generation.decision(Op::Read, Draw::Fail))
@@ -1064,6 +1086,9 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         bufs: impl Into<IoBufs> + Send,
         options: WriteOptions,
     ) -> Result<(), Error> {
+        if self.generation.crashed() {
+            return futures::future::pending().await;
+        }
         let bufs = bufs.into();
         let total_bytes = bufs.remaining() as u64;
         let sync = options.contains(WriteOptions::SYNC);
@@ -1160,6 +1185,9 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
     }
 
     async fn resize(&self, len: u64) -> Result<(), Error> {
+        if self.generation.crashed() {
+            return futures::future::pending().await;
+        }
         let (should_fail, partial_rate, retain) = self.ctx.check_resize_fault(&self.generation);
         let _mutation = self.generation.mutation.lock().await;
         if should_fail {
@@ -1184,6 +1212,9 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
     }
 
     async fn sync(&self) -> Result<(), Error> {
+        if self.generation.crashed() {
+            return futures::future::pending().await;
+        }
         if self
             .ctx
             .should_fail(&self.generation.decision(Op::Sync, Draw::Fail))
@@ -1201,6 +1232,9 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
     }
 
     async fn start_sync(&self) -> Handle<()> {
+        if self.generation.crashed() {
+            return futures::future::pending().await;
+        }
         if self
             .ctx
             .should_fail(&self.generation.decision(Op::Sync, Draw::Fail))
