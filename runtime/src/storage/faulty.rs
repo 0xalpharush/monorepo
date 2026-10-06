@@ -137,6 +137,12 @@ pub struct Config {
     /// Probability that a successful, non-empty `read_at` returns its data with exactly one bit
     /// flipped. Durable contents are unchanged.
     pub corrupt_read_rate: Option<Probability>,
+
+    /// Probability that a `write_at`, `sync`, or `start_sync` of a partition owned by a live
+    /// simulated process crashes that process during the operation. The write is issued without
+    /// synchronization (so a crash resolves it like any other unsynchronized write), a sync is
+    /// not performed, and the operation never completes.
+    pub crash_rate: Option<Probability>,
 }
 
 impl Config {
@@ -201,6 +207,12 @@ impl Config {
         self.corrupt_read_rate = Some(rate);
         self
     }
+
+    /// Set the probability that a write or sync crashes the process that owns its partition.
+    pub const fn crash(mut self, rate: Probability) -> Self {
+        self.crash_rate = Some(rate);
+        self
+    }
 }
 
 /// What one storage fault decision determines.
@@ -223,6 +235,8 @@ pub enum Draw {
     Corrupt,
     /// The index of the bit flipped in a corrupted read (bit `i` is bit `i % 8` of byte `i / 8`).
     CorruptBit,
+    /// Whether a write or sync crashes the process that owns its partition.
+    Crash,
 }
 
 /// One storage fault decision: the file and operation it concerns, and what it determines.
@@ -270,7 +284,21 @@ impl Policy for SharedRng {
 struct Oracle {
     policy: Arc<dyn Policy>,
     config: Arc<RwLock<Config>>,
+    crasher: CrasherSlot,
 }
+
+/// Crashes the simulated processes that own partitions, installed by the owning runtime.
+pub(crate) trait Crasher: Send + Sync {
+    /// Whether a live process owns `partition`.
+    fn owns(&self, partition: &str) -> bool;
+
+    /// Crash the process that owns `partition`.
+    fn crash(&self, partition: &str);
+}
+
+/// Filled once the owning runtime exists (storage is created before its executor) and emptied
+/// when it shuts down.
+pub(crate) type CrasherSlot = Arc<Mutex<Option<Arc<dyn Crasher>>>>;
 
 /// An issued mutation or durability cut whose crash outcome remains unresolved.
 enum PendingMutation<B> {
@@ -424,6 +452,31 @@ impl Oracle {
 
     /// Check if a write fault should be injected.
     /// Reads config once to avoid nested lock acquisition.
+    /// Check whether `op` on `file` crashes the process that owns it. Draws only when crashes
+    /// are enabled and a live process owns the file's partition.
+    fn should_crash(&self, file: &FileGeneration, op: Op) -> bool {
+        let Some(rate) = self.config.read().crash_rate.filter(|rate| !rate.is_zero()) else {
+            return false;
+        };
+        let Some(crasher) = self.crasher.lock().clone() else {
+            return false;
+        };
+        crasher.owns(&file.file.0) && self.roll(&file.decision(op, Draw::Crash), rate)
+    }
+
+    /// Crash the process that owns `file`, from within one of its operations.
+    ///
+    /// The process's tasks are aborted, so the operation's caller is never polled again. The
+    /// operation must then never complete.
+    fn crash(&self, file: &FileGeneration) {
+        let crasher = self
+            .crasher
+            .lock()
+            .clone()
+            .expect("a crash was decided without a crasher");
+        crasher.crash(&file.file.0);
+    }
+
     fn check_write_fault(
         &self,
         file: &FileGeneration,
@@ -575,7 +628,11 @@ impl<S: crate::Storage> Storage<S> {
     pub fn with_policy(inner: S, policy: Arc<dyn Policy>, config: Arc<RwLock<Config>>) -> Self {
         Self {
             inner,
-            ctx: Oracle { policy, config },
+            ctx: Oracle {
+                policy,
+                config,
+                crasher: Arc::default(),
+            },
             pending: Arc::new(Mutex::new(Vec::new())),
             generations: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -584,6 +641,11 @@ impl<S: crate::Storage> Storage<S> {
     /// Get a reference to the inner storage.
     pub const fn inner(&self) -> &S {
         &self.inner
+    }
+
+    /// The slot the owning runtime installs its [Crasher] into.
+    pub(crate) fn crasher(&self) -> CrasherSlot {
+        self.ctx.crasher.clone()
     }
 
     /// The policy deciding this storage's faults.
@@ -1012,6 +1074,22 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
             .checked_add(total_bytes)
             .ok_or(Error::OffsetOverflow)?;
         let (should_fail, write_retention) = self.ctx.check_write_fault(&self.generation);
+        if !should_fail && self.ctx.should_crash(&self.generation, Op::Write) {
+            {
+                let _mutation = self.generation.mutation.lock().await;
+                let pending = write_retention.map(|retention| (bufs.clone(), retention));
+                self.inner
+                    .write_at(offset, bufs, options.without(WriteOptions::SYNC))
+                    .await?;
+                self.size
+                    .fetch_max(offset.saturating_add(total_bytes), Ordering::Relaxed);
+                if let Some((bufs, retention)) = pending {
+                    self.record_pending(offset, bufs, retention);
+                }
+            }
+            self.ctx.crash(&self.generation);
+            return futures::future::pending().await;
+        }
         let _mutation = self.generation.mutation.lock().await;
         if should_fail {
             if let Some(retention) = write_retention {
@@ -1112,6 +1190,10 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         {
             return Err(injected_io_error().into());
         }
+        if self.ctx.should_crash(&self.generation, Op::Sync) {
+            self.ctx.crash(&self.generation);
+            return futures::future::pending().await;
+        }
         let _mutation = self.generation.mutation.lock().await;
         self.inner.sync().await?;
         clear_pending(&self.pending, std::slice::from_ref(&self.generation));
@@ -1124,6 +1206,10 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
             .should_fail(&self.generation.decision(Op::Sync, Draw::Fail))
         {
             return Handle::ready(Err(injected_io_error().into()));
+        }
+        if self.ctx.should_crash(&self.generation, Op::Sync) {
+            self.ctx.crash(&self.generation);
+            return futures::future::pending().await;
         }
         let _mutation = self.generation.mutation.lock().await;
         let sync = Arc::new(PendingSync {
