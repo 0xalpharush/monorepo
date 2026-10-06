@@ -42,14 +42,19 @@
 //! });
 //! ```
 
+pub use crate::network::deterministic::{
+    Delivery as NetworkDelivery, Link as NetworkLink, Policy as NetworkPolicy,
+};
 pub use crate::storage::faulty::{
-    Config as FaultConfig, PartialWriteMode, ResizeConfig, WriteConfig,
+    Config as FaultConfig, Decision as FaultDecision, Draw as FaultDraw, Op as StorageOp,
+    PartialWriteMode, Policy as FaultPolicy, ResizeConfig, SharedRng, WriteConfig,
 };
 use crate::{
     BlobVersion, BufferPool, BufferPoolConfig, Clock, Error, Execution, Handle, IoBufs, ListenerOf,
     METRICS_PREFIX, Name, Panicked, child_label,
     network::{
-        audited::Network as AuditedNetwork, deterministic::Network as DeterministicNetwork,
+        audited::Network as AuditedNetwork,
+        deterministic::{Network as DeterministicNetwork, Timer, TimerSlot},
         metered::Network as MeteredNetwork,
     },
     prefixed_name,
@@ -222,10 +227,45 @@ impl Auditor {
 /// A dynamic RNG that can safely be sent between threads.
 pub type BoxDynRng = Box<dyn CryptoRng + Send + 'static>;
 
+/// One occurrence of a runnable task in a snapshotted polling batch.
+pub struct RunnableTask {
+    id: u128,
+    label: String,
+    occurrence: u64,
+}
+
+impl RunnableTask {
+    /// Stable spawn-order identity within this runtime incarnation.
+    pub const fn id(&self) -> u128 {
+        self.id
+    }
+
+    /// Supervisor-derived task label, including runtime attributes.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Distinguishes repeated wakeups for the same task in this batch.
+    pub const fn occurrence(&self) -> u64 {
+        self.occurrence
+    }
+}
+
+/// Controls cooperative polling order, not native-thread preemption.
+/// A policy must only permute the batch; it cannot add, remove, or modify tasks.
+pub trait SchedulingPolicy: Send + 'static {
+    /// Reorders the current runnable batch at this virtual time.
+    fn order(&mut self, time: SystemTime, ready: &mut [RunnableTask]);
+}
+
+type BoxDynSchedulingPolicy = Box<dyn SchedulingPolicy>;
+
 /// Configuration for the `deterministic` runtime.
 pub struct Config {
     /// Random number generator.
     rng: BoxDynRng,
+
+    scheduling_policy: Option<BoxDynSchedulingPolicy>,
 
     /// The cycle duration determines how much time is advanced after each iteration of the event
     /// loop. This is useful to prevent starvation if some task never yields.
@@ -243,6 +283,12 @@ pub struct Config {
     /// Configuration for deterministic storage fault injection.
     /// Defaults to no faults being injected.
     storage_fault_cfg: FaultConfig,
+
+    /// Decides each storage fault the configuration enables. Defaults to the shared RNG.
+    storage_fault_policy: Option<Arc<dyn FaultPolicy>>,
+
+    /// Decides connection faults and latency. Defaults to lossless, zero-latency connections.
+    network_policy: Option<Arc<dyn NetworkPolicy>>,
 
     /// Buffer pool configuration for network I/O.
     network_buffer_pool_cfg: BufferPoolConfig,
@@ -273,11 +319,14 @@ impl Config {
 
         Self {
             rng: Box::new(StdRng::seed_from_u64(42)),
+            scheduling_policy: None,
             cycle: Duration::from_millis(1),
             start_time: UNIX_EPOCH,
             timeout: None,
             catch_panics: false,
             storage_fault_cfg: FaultConfig::default(),
+            storage_fault_policy: None,
+            network_policy: None,
             network_buffer_pool_cfg,
             storage_buffer_pool_cfg,
         }
@@ -297,6 +346,12 @@ impl Config {
     /// RNG object, any behavior is possible.
     pub fn with_rng(mut self, rng: impl Into<BoxDynRng>) -> Self {
         self.rng = rng.into();
+        self
+    }
+
+    /// Replaces seeded batch shuffling with a controlled cooperative policy.
+    pub fn with_scheduling_policy(mut self, policy: impl SchedulingPolicy) -> Self {
+        self.scheduling_policy = Some(Box::new(policy));
         self
     }
 
@@ -338,6 +393,27 @@ impl Config {
     /// reproducible failure patterns for a given seed.
     pub const fn with_storage_fault_config(mut self, faults: FaultConfig) -> Self {
         self.storage_fault_cfg = faults;
+        self
+    }
+
+    /// Decide each storage fault with `policy` instead of the shared RNG.
+    ///
+    /// The fault configuration still selects which faults can occur; the policy sees every
+    /// individual decision with the file and operation it concerns, so it can derive, record,
+    /// replay, or override each one independently of all other randomness in the runtime. The
+    /// policy survives [Runner::start_and_recover].
+    pub fn with_storage_fault_policy(mut self, policy: Arc<dyn FaultPolicy>) -> Self {
+        self.storage_fault_policy = Some(policy);
+        self
+    }
+
+    /// Decide each dial's success and each send's latency or reset with `policy`.
+    ///
+    /// Without a policy, connections are lossless, ordered, zero-latency pipes. The policy sees
+    /// every dial and send with the connection it concerns, so it can derive, record, replay, or
+    /// override each decision independently. The policy survives [Runner::start_and_recover].
+    pub fn with_network_policy(mut self, policy: Arc<dyn NetworkPolicy>) -> Self {
+        self.network_policy = Some(policy);
         self
     }
 
@@ -398,6 +474,8 @@ pub struct Executor {
     metrics: Arc<Metrics>,
     auditor: Arc<Auditor>,
     rng: Arc<Mutex<BoxDynRng>>,
+    scheduling_policy: Option<Arc<Mutex<BoxDynSchedulingPolicy>>>,
+    network_policy: Option<Arc<dyn NetworkPolicy>>,
     time: Mutex<SystemTime>,
     tasks: Arc<Tasks>,
     sleeping: Mutex<BinaryHeap<Alarm>>,
@@ -407,6 +485,46 @@ pub struct Executor {
 }
 
 impl Executor {
+    fn order_ready(&self, current: SystemTime, queue: &mut Vec<u128>) {
+        let Some(policy) = &self.scheduling_policy else {
+            if queue.len() > 1 {
+                queue.shuffle(&mut *self.rng.lock());
+            }
+            return;
+        };
+        let mut occurrences = BTreeMap::<u128, u64>::new();
+        let mut ready: Vec<_> = queue
+            .iter()
+            .filter_map(|id| {
+                let task = self.tasks.get(*id)?;
+                let occurrence = occurrences.entry(*id).or_default();
+                let item = RunnableTask {
+                    id: *id,
+                    label: task.label.name(),
+                    occurrence: *occurrence,
+                };
+                *occurrence += 1;
+                Some(item)
+            })
+            .collect();
+        let mut before: Vec<_> = ready
+            .iter()
+            .map(|task| (task.id, task.occurrence))
+            .collect();
+        before.sort_unstable();
+        policy.lock().order(current, &mut ready);
+        let mut after: Vec<_> = ready
+            .iter()
+            .map(|task| (task.id, task.occurrence))
+            .collect();
+        after.sort_unstable();
+        assert_eq!(
+            before, after,
+            "scheduling policy changed the runnable batch"
+        );
+        *queue = ready.into_iter().map(|task| task.id).collect();
+    }
+
     /// Advance simulated time by [Config::cycle].
     ///
     /// When built with the `external` feature, sleep for [Config::cycle] to let
@@ -506,9 +624,12 @@ pub struct Checkpoint {
     deadline: Option<SystemTime>,
     auditor: Arc<Auditor>,
     rng: Arc<Mutex<BoxDynRng>>,
+    scheduling_policy: Option<Arc<Mutex<BoxDynSchedulingPolicy>>>,
     time: Mutex<SystemTime>,
     storage: MemStorageSnapshot,
     storage_fault_cfg: FaultConfig,
+    storage_fault_policy: Arc<dyn FaultPolicy>,
+    network_policy: Option<Arc<dyn NetworkPolicy>>,
     dns: Mutex<HashMap<String, Vec<IpAddr>>>,
     catch_panics: bool,
     network_buffer_pool_cfg: BufferPoolConfig,
@@ -606,11 +727,7 @@ impl Runner {
                 // Drain all ready tasks
                 let mut queue = executor.tasks.drain();
 
-                // Shuffle tasks (if more than one)
-                if queue.len() > 1 {
-                    let mut rng = executor.rng.lock();
-                    queue.shuffle(&mut *rng);
-                }
+                executor.order_ready(current, &mut queue);
 
                 // Run all snapshotted tasks
                 //
@@ -723,6 +840,7 @@ impl Runner {
             .crash()
             .expect("retaining successful unsynced writes at crash should succeed");
         let storage_fault_cfg = storage.inner().inner().config().read().clone();
+        let storage_fault_policy = storage.inner().inner().policy();
         let storage = storage.inner().inner().inner().take_snapshot();
 
         // Assert the context doesn't escape the start() function (behavior
@@ -747,9 +865,12 @@ impl Runner {
             deadline: executor.deadline,
             auditor: executor.auditor,
             rng: executor.rng,
+            scheduling_policy: executor.scheduling_policy,
+            network_policy: executor.network_policy,
             time: executor.time,
             storage,
             storage_fault_cfg,
+            storage_fault_policy,
             dns: executor.dns,
             catch_panics: executor.panicker.catch(),
             network_buffer_pool_cfg,
@@ -931,14 +1052,14 @@ pub type Blob = OpenBlob<MeteredBlob<AuditedBlob<FaultyBlob<MemBlob>>>>;
 
 fn build_storage(
     inner: MemStorage,
-    rng: Arc<Mutex<BoxDynRng>>,
+    policy: Arc<dyn FaultPolicy>,
     faults: FaultConfig,
     auditor: Arc<Auditor>,
     registry: &mut impl Register,
 ) -> Storage {
     MeteredStorage::new(
         AuditedStorage::new(
-            FaultyStorage::new(inner, rng, Arc::new(RwLock::new(faults))),
+            FaultyStorage::with_policy(inner, policy, Arc::new(RwLock::new(faults))),
             auditor,
         ),
         registry,
@@ -988,16 +1109,23 @@ impl Context {
             &mut runtime_registry.sub_registry("storage_buffer_pool"),
         );
 
+        let policy = cfg
+            .storage_fault_policy
+            .unwrap_or_else(|| Arc::new(SharedRng(rng.clone())));
         let storage = build_storage(
             MemStorage::new(storage_buffer_pool.clone()),
-            rng.clone(),
+            policy,
             cfg.storage_fault_cfg,
             auditor.clone(),
             &mut runtime_registry,
         );
 
-        // Create network
-        let network = AuditedNetwork::new(DeterministicNetwork::default(), auditor.clone());
+        // Create network; its timer is installed once the executor exists
+        let timer = TimerSlot::default();
+        let network = AuditedNetwork::new(
+            DeterministicNetwork::with_policy(cfg.network_policy.clone(), timer.clone()),
+            auditor.clone(),
+        );
         let network = MeteredNetwork::new(network, &mut runtime_registry);
 
         // Initialize panicker
@@ -1010,6 +1138,10 @@ impl Context {
             metrics,
             auditor,
             rng,
+            scheduling_policy: cfg
+                .scheduling_policy
+                .map(|policy| Arc::new(Mutex::new(policy))),
+            network_policy: cfg.network_policy,
             time: Mutex::new(start_time),
             tasks: Arc::new(Tasks::new()),
             sleeping: Mutex::new(BinaryHeap::new()),
@@ -1017,6 +1149,7 @@ impl Context {
             panicker,
             dns: Mutex::new(HashMap::new()),
         });
+        install_timer(&timer, &executor);
 
         (
             Self {
@@ -1055,8 +1188,11 @@ impl Context {
         let metrics = Arc::new(Metrics::init(&mut runtime_registry));
 
         // Copy state
-        let network =
-            AuditedNetwork::new(DeterministicNetwork::default(), checkpoint.auditor.clone());
+        let timer = TimerSlot::default();
+        let network = AuditedNetwork::new(
+            DeterministicNetwork::with_policy(checkpoint.network_policy.clone(), timer.clone()),
+            checkpoint.auditor.clone(),
+        );
         let network = MeteredNetwork::new(network, &mut runtime_registry);
 
         // Initialize buffer pools
@@ -1070,7 +1206,7 @@ impl Context {
         );
         let storage = build_storage(
             MemStorage::from_snapshot(checkpoint.storage, storage_buffer_pool.clone()),
-            checkpoint.rng.clone(),
+            checkpoint.storage_fault_policy,
             checkpoint.storage_fault_cfg,
             checkpoint.auditor.clone(),
             &mut runtime_registry,
@@ -1085,6 +1221,8 @@ impl Context {
             deadline: checkpoint.deadline,
             auditor: checkpoint.auditor,
             rng: checkpoint.rng,
+            scheduling_policy: checkpoint.scheduling_policy,
+            network_policy: checkpoint.network_policy,
             time: checkpoint.time,
             dns: checkpoint.dns,
 
@@ -1096,6 +1234,7 @@ impl Context {
             shutdown: Mutex::new(Stopper::default()),
             panicker,
         });
+        install_timer(&timer, &executor);
         (
             Self {
                 name: String::new(),
@@ -1152,6 +1291,25 @@ impl Context {
     /// disabling fault injection during a test.
     pub fn storage_fault_config(&self) -> Arc<RwLock<FaultConfig>> {
         self.storage.inner().inner().config()
+    }
+
+    /// Crash the storage of every partition `affected` selects while the runtime keeps running.
+    ///
+    /// Each affected partition's unsynchronized mutations are resolved as a crash at this point
+    /// would resolve them (per the fault policy's retention decisions), and every handle opened
+    /// before the crash stops publishing. Reopening an affected blob observes only its surviving
+    /// contents. Other partitions, tasks, and the network are untouched, so one simulated process
+    /// can crash and restart while its peers keep running.
+    ///
+    /// The caller must first stop every task that uses an affected partition (for example by
+    /// aborting the task whose supervision subtree owns them).
+    pub fn crash_storage(&self, affected: impl Fn(&str) -> bool) {
+        self.executor().auditor.event(b"crash_storage", |_| {});
+        self.storage
+            .inner()
+            .inner()
+            .crash_partitions(affected)
+            .expect("retaining successful unsynced writes at crash should succeed");
     }
 
     /// Register a DNS mapping for a hostname.
@@ -1456,6 +1614,34 @@ impl Clock for Context {
     }
 }
 
+/// Times network latency with the executor's simulated clock. Holds only a weak reference, so
+/// the network never keeps its executor alive.
+struct ExecutorTimer(Weak<Executor>);
+
+impl Timer for ExecutorTimer {
+    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let executor = self.0.upgrade().expect("executor already dropped");
+        let time = executor
+            .time
+            .lock()
+            .checked_add(delay)
+            .expect("overflow when setting wake time");
+        Box::pin(Sleeper {
+            executor: self.0.clone(),
+            time,
+            waker: None,
+        })
+    }
+}
+
+fn install_timer(slot: &TimerSlot, executor: &Arc<Executor>) {
+    assert!(
+        slot.set(Arc::new(ExecutorTimer(Arc::downgrade(executor))))
+            .is_ok(),
+        "network timer installed twice"
+    );
+}
+
 /// A future that resolves when a given target time is reached.
 ///
 /// If the future is not ready at the target time, the future is blocked until the target time is reached.
@@ -1691,6 +1877,64 @@ mod tests {
     use futures::stream::StreamExt as _;
     use futures::{FutureExt as _, stream::FuturesUnordered};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ReversePolicy(Arc<Mutex<usize>>);
+
+    impl SchedulingPolicy for ReversePolicy {
+        fn order(&mut self, _: SystemTime, ready: &mut [RunnableTask]) {
+            *self.0.lock() += 1;
+            ready.sort_by_key(|task| std::cmp::Reverse((task.id(), task.occurrence())));
+        }
+    }
+
+    #[test]
+    fn test_controlled_order_and_policy_recovery() {
+        let calls = Arc::new(Mutex::new(0));
+        let config = Config::new().with_scheduling_policy(ReversePolicy(calls.clone()));
+        let (order, checkpoint) = Runner::new(config).start_and_recover(|context| async move {
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let first_order = order.clone();
+            let first = context.child("first").spawn(move |_| async move {
+                first_order.lock().push(1);
+            });
+            let second_order = order.clone();
+            let second = context.child("second").spawn(move |_| async move {
+                second_order.lock().push(2);
+            });
+            first.await.unwrap();
+            second.await.unwrap();
+            order.lock().clone()
+        });
+        assert_eq!(order, vec![2, 1]);
+        let before = *calls.lock();
+        Runner::from(checkpoint).start(|context| async move {
+            context.sleep(Duration::from_millis(1)).await;
+        });
+        assert!(*calls.lock() > before);
+    }
+
+    struct DuplicatingPolicy;
+
+    impl SchedulingPolicy for DuplicatingPolicy {
+        fn order(&mut self, _: SystemTime, ready: &mut [RunnableTask]) {
+            if ready.len() > 1 {
+                ready[1].id = ready[0].id;
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "scheduling policy changed the runnable batch")]
+    fn test_policy_cannot_change_ready_set() {
+        Runner::new(Config::new().with_scheduling_policy(DuplicatingPolicy)).start(
+            |context| async move {
+                let first = context.child("first").spawn(|_| async {});
+                let second = context.child("second").spawn(|_| async {});
+                first.await.unwrap();
+                second.await.unwrap();
+            },
+        );
+    }
 
     #[rstest::rstest]
     #[case::open_named(true, true)]
@@ -2861,6 +3105,172 @@ mod tests {
             // Verify data persisted
             let read_buf = blob.read_at(0, 9, ReadOptions::default()).await.unwrap();
             assert_eq!(read_buf.coalesce(), b"recovered");
+        });
+    }
+
+    /// Delays the first send on every link, resets a link's third send, and refuses dials to
+    /// one port.
+    struct ScriptedNetwork;
+
+    impl NetworkPolicy for ScriptedNetwork {
+        fn connects(&self, _: SocketAddr, listener: SocketAddr) -> bool {
+            listener.port() != 4000
+        }
+
+        fn delivers(&self, _: NetworkLink, index: u64, _: usize) -> NetworkDelivery {
+            match index {
+                0 => NetworkDelivery::After(Duration::from_millis(250)),
+                2 => NetworkDelivery::Reset,
+                _ => NetworkDelivery::After(Duration::ZERO),
+            }
+        }
+    }
+
+    #[test]
+    fn test_network_policy_delays_resets_and_refuses() {
+        use crate::{Listener as _, Network as _, Sink as _, Stream as _};
+        let cfg = deterministic::Config::default().with_network_policy(Arc::new(ScriptedNetwork));
+        deterministic::Runner::new(cfg).start(|ctx| async move {
+            let refused = SocketAddr::from(([127, 0, 0, 1], 4000));
+            let _refusing = ctx.bind(refused).await.unwrap();
+            assert!(matches!(ctx.dial(refused).await, Err(Error::ConnectionFailed)));
+
+            let address = SocketAddr::from(([127, 0, 0, 1], 4001));
+            let mut listener = ctx.bind(address).await.unwrap();
+            let (mut sink, _stream) = ctx.dial(address).await.unwrap();
+            let (_, _, mut stream) = listener.accept().await.unwrap();
+            let start = ctx.current();
+            sink.send(b"first".to_vec()).await.unwrap();
+            assert_eq!(
+                ctx.current().duration_since(start).unwrap(),
+                Duration::from_millis(250)
+            );
+            sink.send(b"second".to_vec()).await.unwrap();
+            assert_eq!(stream.recv(11).await.unwrap().coalesce(), b"firstsecond");
+            assert!(matches!(sink.send(b"third".to_vec()).await, Err(Error::Closed)));
+            assert!(matches!(sink.send(b"fourth".to_vec()).await, Err(Error::Closed)));
+            assert!(stream.recv(1).await.is_err(), "a reset closes the peer's stream");
+        });
+    }
+
+    #[test]
+    fn test_abort_stops_descendants_immediately() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let ticks = Arc::new(AtomicUsize::new(0));
+            let child_ticks = ticks.clone();
+            let parent = ctx.child("parent").spawn(move |ctx| async move {
+                ctx.child("child").spawn(move |ctx| async move {
+                    loop {
+                        child_ticks.fetch_add(1, Ordering::SeqCst);
+                        ctx.sleep(Duration::from_millis(1)).await;
+                    }
+                });
+                futures::future::pending::<()>().await;
+            });
+            ctx.sleep(Duration::from_millis(10)).await;
+            parent.abort();
+            let stopped = ticks.load(Ordering::SeqCst);
+            ctx.sleep(Duration::from_millis(10)).await;
+            assert_eq!(ticks.load(Ordering::SeqCst), stopped);
+        });
+    }
+
+    #[test]
+    fn test_dropped_listener_frees_its_port() {
+        use crate::Network as _;
+        deterministic::Runner::default().start(|ctx| async move {
+            let address = SocketAddr::from(([127, 0, 0, 1], 4002));
+            let listener = ctx.bind(address).await.unwrap();
+            assert!(matches!(ctx.bind(address).await, Err(Error::BindFailed)));
+            drop(listener);
+            assert!(matches!(ctx.dial(address).await, Err(Error::ConnectionFailed)));
+            let _rebound = ctx.bind(address).await.unwrap();
+            ctx.dial(address).await.unwrap();
+        });
+    }
+
+    /// Records every storage fault decision and fails exactly the syncs of one partition.
+    #[derive(Default)]
+    struct FailPartitionSyncs {
+        #[allow(clippy::type_complexity)]
+        seen: Mutex<Vec<(String, Option<Vec<u8>>, StorageOp, FaultDraw)>>,
+    }
+
+    impl FaultPolicy for FailPartitionSyncs {
+        fn occurs(&self, decision: &FaultDecision<'_>, _: commonware_utils::Probability) -> bool {
+            self.seen.lock().push((
+                decision.partition.to_string(),
+                decision.name.map(<[u8]>::to_vec),
+                decision.op,
+                decision.draw,
+            ));
+            decision.op == StorageOp::Sync && decision.partition == "faulty"
+        }
+
+        fn between(&self, _: &FaultDecision<'_>, range: std::ops::Range<u64>) -> u64 {
+            range.start
+        }
+    }
+
+    #[test]
+    fn test_storage_fault_policy_decides_each_fault() {
+        let policy = Arc::new(FailPartitionSyncs::default());
+        let cfg = deterministic::Config::default()
+            .with_storage_fault_config(FaultConfig::default().sync(probability!(0.5)))
+            .with_storage_fault_policy(policy.clone());
+        deterministic::Runner::new(cfg).start(|ctx| async move {
+            for (partition, fails) in [("faulty", true), ("healthy", false)] {
+                let (blob, _) = ctx.open(partition, b"blob").await.unwrap();
+                blob.write_at(0, b"data".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(blob.sync().await.is_err(), fails, "{partition}");
+            }
+        });
+        let seen = policy.seen.lock();
+        let syncs: Vec<_> = seen
+            .iter()
+            .filter(|(_, _, op, _)| *op == StorageOp::Sync)
+            .map(|(partition, name, _, draw)| (partition.as_str(), name.as_deref(), *draw))
+            .collect();
+        assert_eq!(
+            syncs,
+            [
+                ("faulty", Some(&b"blob"[..]), FaultDraw::Fail),
+                ("healthy", Some(&b"blob"[..]), FaultDraw::Fail)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_crash_storage_crashes_only_selected_partitions() {
+        deterministic::Runner::default().start(|ctx| async move {
+            for partition in ["node0", "node1"] {
+                let (blob, _) = ctx.open(partition, b"blob").await.unwrap();
+                blob.write_at(0, b"durable".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+                blob.sync().await.unwrap();
+                blob.write_at(0, b"pending".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+            }
+            let (survivor, _) = ctx.open("node1", b"other").await.unwrap();
+            survivor
+                .write_at(0, b"live".to_vec(), WriteOptions::default())
+                .await
+                .unwrap();
+
+            ctx.crash_storage(|partition| partition == "node0");
+
+            // The crashed partition keeps only its synced bytes.
+            let (blob, len) = ctx.open("node0", b"blob").await.unwrap();
+            assert_eq!(len, 7);
+            let read = blob.read_at(0, 7, ReadOptions::default()).await.unwrap();
+            assert_eq!(read.coalesce(), b"durable");
+            // Other partitions keep their live handles and unsynced writes.
+            survivor.sync().await.unwrap();
+            assert_eq!(ctx.logical_blob("node1", b"other").as_deref(), Some(&b"live"[..]));
         });
     }
 
