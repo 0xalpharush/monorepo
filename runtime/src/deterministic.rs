@@ -114,7 +114,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
     },
     task::{self, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -546,6 +546,8 @@ pub struct Executor {
     parked: Mutex<Vec<u128>>,
     /// Live simulated processes, in start order.
     processes: Mutex<Vec<Arc<ProcessHost>>>,
+    /// Live simulated processes whose disk is full.
+    full_disks: AtomicUsize,
     /// Tasks held back by the scheduling policy, and when each is released.
     held: Mutex<Held>,
     shutdown: Mutex<Stopper>,
@@ -631,6 +633,9 @@ impl Executor {
                 .map(|index| processes.remove(index))
         };
         if live.is_some() {
+            if host.disk_full.swap(false, AtomicOrdering::Relaxed) {
+                self.full_disks.fetch_sub(1, AtomicOrdering::Relaxed);
+            }
             host.crash(self);
         }
     }
@@ -988,6 +993,7 @@ impl Runner {
 
         // Release simulated processes and the storage's way back to the executor.
         storage.inner().inner().crasher().lock().take();
+        storage.inner().inner().timer().lock().take();
         executor.processes.lock().clear();
 
         // No task can issue or make a write durable after this crash boundary.
@@ -1310,6 +1316,7 @@ impl Context {
             sleeping: Mutex::new(BinaryHeap::new()),
             parked: Mutex::new(Vec::new()),
             processes: Mutex::new(Vec::new()),
+            full_disks: AtomicUsize::new(0),
             held: Mutex::new(Held::default()),
             shutdown: Mutex::new(Stopper::default()),
             panicker,
@@ -1317,6 +1324,7 @@ impl Context {
         });
         install_timer(&timer, &executor);
         install_crasher(&storage, &executor);
+        install_storage_timer(&storage, &executor);
 
         (
             Self {
@@ -1401,12 +1409,14 @@ impl Context {
             sleeping: Mutex::new(BinaryHeap::new()),
             parked: Mutex::new(Vec::new()),
             processes: Mutex::new(Vec::new()),
+            full_disks: AtomicUsize::new(0),
             held: Mutex::new(Held::default()),
             shutdown: Mutex::new(Stopper::default()),
             panicker,
         });
         install_timer(&timer, &executor);
         install_crasher(&storage, &executor);
+        install_storage_timer(&storage, &executor);
         (
             Self {
                 name: String::new(),
@@ -1429,11 +1439,6 @@ impl Context {
     /// Upgrade Weak reference to [Executor].
     fn executor(&self) -> Arc<Executor> {
         self.executor.upgrade().expect("executor already dropped")
-    }
-
-    /// Signed offset of this context's clock from the runtime's, in nanoseconds.
-    fn clock_offset(&self) -> i128 {
-        self.process.as_ref().map_or(0, |process| process.offset())
     }
 
     /// Get a reference to [Metrics].
@@ -1663,15 +1668,16 @@ impl Context {
         let state = Arc::new(ProcessState {
             parent: context.process.take(),
             paused: AtomicBool::new(false),
-            offset: Mutex::new(0),
+            clock: Mutex::new(ProcessClock::default()),
         });
         context.process = Some(Arc::clone(&state));
         let host = Arc::new(ProcessHost {
             state,
             tree: Arc::clone(&context.tree),
             storage: context.storage.clone(),
-            partitions: Box::new(partitions),
+            partitions: Arc::new(partitions),
             crashed: AtomicBool::new(false),
+            disk_full: AtomicBool::new(false),
         });
         self.executor().processes.lock().push(Arc::clone(&host));
         let process = Process {
@@ -1839,8 +1845,9 @@ struct ProcessHost {
     state: Arc<ProcessState>,
     tree: Arc<Tree>,
     storage: Arc<Storage>,
-    partitions: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    partitions: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     crashed: AtomicBool,
+    disk_full: AtomicBool,
 }
 
 impl ProcessHost {
@@ -1855,7 +1862,7 @@ impl ProcessHost {
         self.storage
             .inner()
             .inner()
-            .crash_partitions(&self.partitions)
+            .crash_partitions(&*self.partitions)
             .expect("retaining successful unsynced writes at crash should succeed");
     }
 }
@@ -1868,6 +1875,9 @@ impl Process {
     /// Its listeners and connections close as their tasks are dropped. Then each owned
     /// partition's unsynchronized writes are resolved as a crash would resolve them (per the
     /// storage fault configuration and policy), and blobs opened before the crash stop publishing.
+    /// The crashed tasks release their blobs once they are next polled, so a restarted process
+    /// reopens them only after awaiting the crashed tasks' handles (or otherwise yielding until
+    /// they are dropped).
     ///
     /// Does nothing if the process already crashed (see [Self::crashed]).
     pub fn crash(self) {
@@ -1904,12 +1914,58 @@ impl Process {
     /// [Clock::sleep_until] in the process (and in processes started from its context), so
     /// setting it jumps the process's clock and setting it repeatedly strobes it. Durations
     /// (as in [Clock::sleep]) and other processes are unaffected.
+    ///
+    /// A drifting clock (see [Self::set_clock_drift]) keeps drifting from the new offset.
     pub fn set_clock_offset(&self, offset: ClockOffset) {
         let nanos = offset.nanos();
-        self.executor().auditor.event(b"clock_offset", |hasher| {
+        let executor = self.executor();
+        executor.auditor.event(b"clock_offset", |hasher| {
             hasher.update(nanos.to_be_bytes());
         });
-        *self.host.state.offset.lock() = nanos;
+        let now = nanos_since_epoch(*executor.time.lock());
+        let mut clock = self.host.state.clock.lock();
+        clock.offset = nanos;
+        clock.anchor = now;
+    }
+
+    /// Fill (or free) the disk holding the process's partitions.
+    ///
+    /// While full, every write or resize that would grow a blob in the process's partitions
+    /// fails with [std::io::ErrorKind::StorageFull] and has no effect; writes within a blob's
+    /// current size still succeed. The disk of a process restarted after a crash starts free.
+    pub fn set_disk_full(&self, full: bool) {
+        let executor = self.executor();
+        executor.auditor.event(b"disk_full", |hasher| {
+            hasher.update([u8::from(full)]);
+        });
+        if self.host.disk_full.swap(full, AtomicOrdering::Relaxed) != full {
+            if full {
+                executor.full_disks.fetch_add(1, AtomicOrdering::Relaxed);
+            } else {
+                executor.full_disks.fetch_sub(1, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
+    /// Make the process's clock run fast (positive) or slow (negative) by `ppm` parts per
+    /// million relative to the runtime's, replacing any previous drift, as an imprecise
+    /// oscillator would.
+    ///
+    /// Drift applies from now on without jumping the clock: it accumulates on top of the
+    /// current offset. Both [Clock::current] and durations measured by the process drift, so a
+    /// fast process's [Clock::sleep] ends early in simulated time. `ppm` must be greater than
+    /// `-1_000_000` (a clock cannot stop or run backwards).
+    pub fn set_clock_drift(&self, ppm: i64) {
+        assert!(ppm > -PPM, "a clock cannot stop or run backwards");
+        let executor = self.executor();
+        executor.auditor.event(b"clock_drift", |hasher| {
+            hasher.update(ppm.to_be_bytes());
+        });
+        let now = nanos_since_epoch(*executor.time.lock());
+        let mut clock = self.host.state.clock.lock();
+        clock.offset = clock.at(now);
+        clock.anchor = now;
+        clock.drift = i128::from(ppm);
     }
 
     fn executor(&self) -> Arc<Executor> {
@@ -1941,8 +1997,36 @@ struct ProcessState {
     /// The process whose context this process was started from, if any.
     parent: Option<Arc<Self>>,
     paused: AtomicBool,
-    /// Signed offset of this process's clock from its parent's, in nanoseconds.
-    offset: Mutex<i128>,
+    /// How this process's clock departs from its parent's.
+    clock: Mutex<ProcessClock>,
+}
+
+/// Parts per million in a whole.
+const PPM: i64 = 1_000_000;
+
+/// How a process's clock departs from its parent's: by `offset` nanoseconds at runtime time
+/// `anchor` (nanoseconds since the epoch), and by `drift` parts per million from then on.
+#[derive(Clone, Copy, Default)]
+struct ProcessClock {
+    offset: i128,
+    anchor: i128,
+    drift: i128,
+}
+
+impl ProcessClock {
+    /// The offset in nanoseconds at runtime time `now`, rounded down so a drifting clock never
+    /// reads ahead of its exact value.
+    fn at(&self, now: i128) -> i128 {
+        let elapsed = now.checked_sub(self.anchor).expect("clock overflow");
+        self.offset
+            .checked_add(
+                elapsed
+                    .checked_mul(self.drift)
+                    .expect("clock overflow")
+                    .div_euclid(i128::from(PPM)),
+            )
+            .expect("clock overflow")
+    }
 }
 
 impl ProcessState {
@@ -1952,25 +2036,58 @@ impl ProcessState {
             || self.parent.as_ref().is_some_and(|parent| parent.paused())
     }
 
-    /// Signed offset of this process's clock from the runtime's, in nanoseconds.
-    fn offset(&self) -> i128 {
-        let parent = self.parent.as_ref().map_or(0, |parent| parent.offset());
+    /// Signed offset of this process's clock from the runtime's at runtime time `now`, in
+    /// nanoseconds.
+    fn offset(&self, now: i128) -> i128 {
+        let parent = self.parent.as_ref().map_or(0, |parent| parent.offset(now));
         parent
-            .checked_add(*self.offset.lock())
+            .checked_add(self.clock.lock().at(now))
             .expect("clock offset overflow")
+    }
+
+    /// Total drift in parts per million of this process and the processes it was started from.
+    fn drift(&self) -> i128 {
+        let parent = self.parent.as_ref().map_or(0, |parent| parent.drift());
+        parent + self.clock.lock().drift
+    }
+
+    /// The earliest runtime time (nanoseconds since the epoch) at which this process's clock
+    /// reads at least `deadline`.
+    fn runtime_time(&self, deadline: i128) -> i128 {
+        // The offset is linear in runtime time up to rounding: estimate, then correct.
+        let drift = self.drift();
+        let base = self.offset(0);
+        let estimate = deadline
+            .checked_sub(base)
+            .and_then(|value| value.checked_mul(i128::from(PPM)))
+            .expect("clock overflow")
+            / (i128::from(PPM) + drift);
+        let mut time = estimate.saturating_sub(2);
+        while time + self.offset(time) < deadline {
+            time += 1;
+        }
+        time
     }
 }
 
-/// Shifts `time` by a signed number of nanoseconds.
-fn shift(time: SystemTime, nanos: i128) -> SystemTime {
-    let magnitude =
-        Duration::from_nanos(u64::try_from(nanos.unsigned_abs()).expect("clock offset overflow"));
-    if nanos >= 0 {
-        time.checked_add(magnitude)
-    } else {
-        time.checked_sub(magnitude)
+/// Nanoseconds from the epoch to `time` (negative before it).
+fn nanos_since_epoch(time: SystemTime) -> i128 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(after) => i128::try_from(after.as_nanos()).expect("time overflow"),
+        Err(before) => -i128::try_from(before.duration().as_nanos()).expect("time overflow"),
     }
-    .expect("clock offset moved time out of range")
+}
+
+/// The time `nanos` nanoseconds from the epoch.
+fn from_nanos_since_epoch(nanos: i128) -> SystemTime {
+    let magnitude =
+        Duration::from_nanos(u64::try_from(nanos.unsigned_abs()).expect("time overflow"));
+    if nanos >= 0 {
+        UNIX_EPOCH.checked_add(magnitude)
+    } else {
+        UNIX_EPOCH.checked_sub(magnitude)
+    }
+    .expect("time out of range")
 }
 
 impl crate::Supervisor for Context {
@@ -2109,7 +2226,12 @@ impl Future for Sleeper {
 
 impl Clock for Context {
     fn current(&self) -> SystemTime {
-        shift(*self.executor().time.lock(), self.clock_offset())
+        let now = nanos_since_epoch(*self.executor().time.lock());
+        let offset = self
+            .process
+            .as_ref()
+            .map_or(0, |process| process.offset(now));
+        from_nanos_since_epoch(now.checked_add(offset).expect("clock overflow"))
     }
 
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send + 'static + use<> {
@@ -2127,7 +2249,9 @@ impl Clock for Context {
         Sleeper {
             executor: self.executor.clone(),
 
-            time: shift(deadline, -self.clock_offset()),
+            time: self.process.as_ref().map_or(deadline, |process| {
+                from_nanos_since_epoch(process.runtime_time(nanos_since_epoch(deadline)))
+            }),
             waker: None,
         }
     }
@@ -2186,6 +2310,16 @@ impl Crasher for ExecutorCrasher {
         });
         executor.crash_process(&owner);
     }
+
+    fn disk_full(&self, partition: &str) -> bool {
+        let any = self
+            .0
+            .upgrade()
+            .is_some_and(|executor| executor.full_disks.load(AtomicOrdering::Relaxed) > 0);
+        any && self
+            .owner(partition)
+            .is_some_and(|(_, owner)| owner.disk_full.load(AtomicOrdering::Relaxed))
+    }
 }
 
 fn install_crasher(storage: &Storage, executor: &Arc<Executor>) {
@@ -2196,6 +2330,16 @@ fn install_crasher(storage: &Storage, executor: &Arc<Executor>) {
         .lock()
         .replace(Arc::new(ExecutorCrasher(Arc::downgrade(executor))));
     assert!(previous.is_none(), "storage crasher installed twice");
+}
+
+fn install_storage_timer(storage: &Storage, executor: &Arc<Executor>) {
+    let previous = storage
+        .inner()
+        .inner()
+        .timer()
+        .lock()
+        .replace(Arc::new(ExecutorTimer(Arc::downgrade(executor))));
+    assert!(previous.is_none(), "storage timer installed twice");
 }
 
 fn install_timer(slot: &TimerSlot, executor: &Arc<Executor>) {
@@ -4221,6 +4365,177 @@ mod tests {
             }
             let (_, len) = ctx.open("node", b"journal").await.unwrap();
             assert_eq!(len, 3);
+        });
+    }
+
+    #[test]
+    fn test_storage_latency_lets_crashes_land_between_write_and_sync() {
+        let cfg = deterministic::Config::default().with_storage_fault_config(
+            FaultConfig::default().latency(Duration::from_millis(10)..Duration::from_millis(10)),
+        );
+        deterministic::Runner::new(cfg).start(|ctx| async move {
+            let (node, process) = ctx.process("node", |partition| partition == "node");
+            let synced = Arc::new(AtomicUsize::new(0));
+            let progress = synced.clone();
+            let writer = node.spawn(move |ctx| async move {
+                let (blob, _) = ctx.open("node", b"journal").await.unwrap();
+                blob.write_at(0, b"durable".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+                blob.sync().await.unwrap();
+                progress.fetch_add(1, Ordering::SeqCst);
+                blob.write_at(7, b"pending".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+                blob.sync().await.unwrap();
+                progress.fetch_add(1, Ordering::SeqCst);
+            });
+            // Writes and syncs each take 10ms; crash during the second sync.
+            let start = ctx.current();
+            ctx.sleep(Duration::from_millis(35)).await;
+            assert_eq!(synced.load(Ordering::SeqCst), 1);
+            process.crash();
+            // The crashed task releases its blob once it is next polled.
+            assert!(writer.await.is_err());
+            let (_, len) = ctx.open("node", b"journal").await.unwrap();
+            assert_eq!(len, 7, "the unsynced write survived");
+            assert!(ctx.current().duration_since(start).unwrap() >= Duration::from_millis(35));
+        });
+    }
+
+    /// Picks the earliest offset for misdirected reads and a fixed latency, recording latencies.
+    #[derive(Default)]
+    struct MisdirectFirst {
+        latencies: Mutex<Vec<(StorageOp, u64)>>,
+    }
+
+    impl FaultPolicy for MisdirectFirst {
+        fn occurs(&self, decision: &FaultDecision<'_>, _: commonware_utils::Probability) -> bool {
+            decision.draw == FaultDraw::MisdirectRead
+        }
+
+        fn between(&self, decision: &FaultDecision<'_>, range: std::ops::Range<u64>) -> u64 {
+            if decision.draw == FaultDraw::Latency {
+                self.latencies.lock().push((decision.op, range.start));
+            }
+            range.start
+        }
+    }
+
+    #[test]
+    fn test_misdirected_read_returns_other_bytes() {
+        let policy = Arc::new(MisdirectFirst::default());
+        let cfg = deterministic::Config::default()
+            .with_storage_fault_config(
+                FaultConfig::default()
+                    .misdirect_read(probability!(0.5))
+                    .latency(Duration::from_millis(1)..Duration::from_millis(3)),
+            )
+            .with_storage_fault_policy(policy.clone());
+        deterministic::Runner::new(cfg).start(|ctx| async move {
+            let (blob, _) = ctx.open("node", b"blob").await.unwrap();
+            blob.write_at(0, b"abcdefgh".to_vec(), WriteOptions::SYNC)
+                .await
+                .unwrap();
+            // A read at 4 is served from offset 0 instead.
+            let read = blob.read_at(4, 4, ReadOptions::default()).await.unwrap();
+            assert_eq!(read.coalesce(), b"abcd");
+            // A read at 0 is served from offset 1 (the earliest other offset).
+            let read = blob.read_at(0, 4, ReadOptions::default()).await.unwrap();
+            assert_eq!(read.coalesce(), b"bcde");
+            // A read of the whole blob has nowhere else to come from.
+            let read = blob.read_at(0, 8, ReadOptions::default()).await.unwrap();
+            assert_eq!(read.coalesce(), b"abcdefgh");
+            assert_eq!(
+                ctx.logical_blob("node", b"blob").as_deref(),
+                Some(&b"abcdefgh"[..])
+            );
+        });
+        let latencies = policy.latencies.lock();
+        assert_eq!(
+            latencies.iter().map(|(op, _)| *op).collect::<Vec<_>>(),
+            [
+                StorageOp::Write,
+                StorageOp::Read,
+                StorageOp::Read,
+                StorageOp::Read
+            ]
+        );
+        assert!(latencies.iter().all(|(_, nanos)| *nanos == 1_000_000));
+    }
+
+    #[test]
+    fn test_disk_full_rejects_growth_only() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let (_node, process) = ctx.process("node", |partition| partition == "node");
+            let (blob, _) = ctx.open("node", b"blob").await.unwrap();
+            blob.write_at(0, b"data".to_vec(), WriteOptions::SYNC)
+                .await
+                .unwrap();
+            process.set_disk_full(true);
+            let full = blob
+                .write_at(4, b"more".to_vec(), WriteOptions::SYNC)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&full, Error::Io(err) if err.kind() == std::io::ErrorKind::StorageFull),
+                "{full:?}"
+            );
+            assert!(blob.resize(16).await.is_err());
+            // Overwrites within the blob still succeed, and other disks are unaffected.
+            blob.write_at(0, b"DATA".to_vec(), WriteOptions::SYNC)
+                .await
+                .unwrap();
+            let (other, _) = ctx.open("other", b"blob").await.unwrap();
+            other
+                .write_at(0, b"grow".to_vec(), WriteOptions::SYNC)
+                .await
+                .unwrap();
+            process.set_disk_full(false);
+            blob.write_at(4, b"more".to_vec(), WriteOptions::SYNC)
+                .await
+                .unwrap();
+            assert_eq!(
+                ctx.logical_blob("node", b"blob").as_deref(),
+                Some(&b"DATAmore"[..])
+            );
+        });
+    }
+
+    #[test]
+    fn test_process_clock_drift() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let (node, process) = ctx.process("node", |_| false);
+            let start = ctx.current();
+            process.set_clock_drift(100_000);
+            ctx.sleep(Duration::from_secs(1)).await;
+            // A clock 10% fast reads 1.1s after 1s, without jumping when the drift was set.
+            assert_eq!(
+                node.current().duration_since(start).unwrap(),
+                Duration::from_millis(1100)
+            );
+            // Its durations end early: 1.1s on its clock is 1s on the runtime's.
+            let before = ctx.current();
+            node.sleep(Duration::from_millis(1100)).await;
+            assert_eq!(
+                ctx.current().duration_since(before).unwrap(),
+                Duration::from_secs(1)
+            );
+
+            // A slow clock, combined with an offset.
+            process.set_clock_offset(ClockOffset::Behind(Duration::from_secs(1)));
+            process.set_clock_drift(-500_000);
+            let runtime = ctx.current();
+            assert_eq!(node.current(), runtime - Duration::from_secs(1));
+            ctx.sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                node.current(),
+                runtime + Duration::from_secs(1) - Duration::from_secs(1)
+            );
+            let deadline = node.current() + Duration::from_millis(500);
+            node.sleep_until(deadline).await;
+            assert!(node.current() >= deadline);
+            assert_eq!(ctx.current(), runtime + Duration::from_secs(3));
         });
     }
 
