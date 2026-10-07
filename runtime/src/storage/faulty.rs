@@ -1353,6 +1353,10 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         self.ctx
             .delay(&self.generation.decision(Op::Read, Draw::Latency))
             .await;
+        // A crash while this operation waited out its latency must not let it complete
+        if self.generation.crashed() {
+            return futures::future::pending().await;
+        }
         if self
             .ctx
             .should_fail(&self.generation.decision(Op::Read, Draw::Fail))
@@ -1383,6 +1387,10 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         self.ctx
             .delay(&self.generation.decision(Op::Read, Draw::Latency))
             .await;
+        // A crash while this operation waited out its latency must not let it complete
+        if self.generation.crashed() {
+            return futures::future::pending().await;
+        }
         if self
             .ctx
             .should_fail(&self.generation.decision(Op::Read, Draw::Fail))
@@ -1415,6 +1423,10 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         self.ctx
             .delay(&self.generation.decision(Op::Write, Draw::Latency))
             .await;
+        // A crash while this operation waited out its latency must not let it complete
+        if self.generation.crashed() {
+            return futures::future::pending().await;
+        }
         let bufs = bufs.into();
         let total_bytes = bufs.remaining() as u64;
         let sync = options.contains(WriteOptions::SYNC);
@@ -1522,6 +1534,10 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         self.ctx
             .delay(&self.generation.decision(Op::Resize, Draw::Latency))
             .await;
+        // A crash while this operation waited out its latency must not let it complete
+        if self.generation.crashed() {
+            return futures::future::pending().await;
+        }
         if len > self.size.load(Ordering::Relaxed) && self.ctx.full(&self.generation) {
             return Err(storage_full().into());
         }
@@ -1555,6 +1571,10 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         self.ctx
             .delay(&self.generation.decision(Op::Sync, Draw::Latency))
             .await;
+        // A crash while this operation waited out its latency must not let it complete
+        if self.generation.crashed() {
+            return futures::future::pending().await;
+        }
         if self
             .ctx
             .should_fail(&self.generation.decision(Op::Sync, Draw::Fail))
@@ -1578,6 +1598,10 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         self.ctx
             .delay(&self.generation.decision(Op::Sync, Draw::Latency))
             .await;
+        // A crash while this operation waited out its latency must not let it complete
+        if self.generation.crashed() {
+            return futures::future::pending().await;
+        }
         if self
             .ctx
             .should_fail(&self.generation.decision(Op::Sync, Draw::Fail))
