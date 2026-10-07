@@ -94,6 +94,31 @@ impl Storage {
             .retain(|(partition, _), _| !affected(partition));
     }
 
+    /// Erase every partition `affected` selects, returning the erased partitions' names in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a blob of an affected partition was opened since its owner last crashed: erase
+    /// only partitions whose owner crashed (and has not been restarted).
+    pub(crate) fn erase_partitions(&self, affected: &impl Fn(&str) -> bool) -> Vec<String> {
+        let generations = self.generations.lock();
+        let mut partitions = self.partitions.lock();
+        if let Some((partition, name)) = generations
+            .current
+            .keys()
+            .find(|(partition, _)| affected(partition))
+        {
+            panic!(
+                "blob {partition}/{} was opened since its owner crashed; crash it before erasing",
+                hex(name)
+            );
+        }
+        partitions
+            .extract_if(.., |partition, _| affected(partition))
+            .map(|(partition, _)| partition)
+            .collect()
+    }
+
     /// Transfer durable contents and retire every live blob generation.
     pub(crate) fn take_snapshot(&self) -> Snapshot {
         let mut generations = self.generations.lock();

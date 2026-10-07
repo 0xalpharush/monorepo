@@ -260,8 +260,12 @@ impl BlobSnapshot {
     }
 }
 
+mod nemesis;
+pub use nemesis::{Jitter, Partitions, Swizzle, SwizzleStep};
 mod scheduling;
 pub use scheduling::{DelayBounded, Pausing, Pct, RandomWalk};
+mod zone;
+pub use zone::Zone;
 
 /// Tasks held back by a [SchedulingPolicy].
 #[derive(Default)]
@@ -2275,6 +2279,10 @@ impl Timer for ExecutorTimer {
             waker: None,
         })
     }
+
+    fn now(&self) -> SystemTime {
+        *self.0.upgrade().expect("executor already dropped").time.lock()
+    }
 }
 
 /// Crashes the processes that own partitions from within their storage operations. Holds only a
@@ -2458,7 +2466,7 @@ impl crate::Network for Context {
         &self,
         socket: SocketAddr,
     ) -> Result<(crate::SinkOf<Self>, crate::StreamOf<Self>), Error> {
-        self.network.dial(socket).await
+        crate::network::deterministic::sourced(self.source_ip(), self.network.dial(socket)).await
     }
 }
 
