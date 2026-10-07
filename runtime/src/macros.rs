@@ -38,3 +38,49 @@ macro_rules! spawn_metrics {
         (label, metric)
     }};
 }
+
+/// Whether a code-level fault point fires, in the style of FoundationDB's `BUGGIFY`.
+///
+/// `buggify!(context)` evaluates [`Supervisor::buggify`](crate::Supervisor::buggify) for the
+/// invocation's source location, and `buggify!(context, rate)` additionally requests the
+/// [`Probability`](commonware_utils::Probability) `rate` with which an enabled site fires. Use a
+/// site to take a rare but legal path, such as flushing early, forcing a slow path, or
+/// shortening a timeout. Forcing the path must never violate the surrounding code's contract.
+///
+/// Outside simulation, a site never fires. In the deterministic runtime, sites are off unless
+/// configured with `deterministic::Config::with_buggify`.
+///
+/// # Examples
+///
+/// ```rust
+/// use commonware_runtime::{buggify, deterministic, Runner};
+///
+/// deterministic::Runner::default().start(|context| async move {
+///     // Sites are off by default.
+///     assert!(!buggify!(context));
+/// });
+/// ```
+#[cfg(not(any(
+    commonware_stability_GAMMA,
+    commonware_stability_DELTA,
+    commonware_stability_EPSILON,
+    commonware_stability_RESERVED
+)))] // BETA
+#[macro_export]
+macro_rules! buggify {
+    ($ctx:expr) => {
+        $crate::buggify!($ctx, @rate ::core::option::Option::None)
+    };
+    ($ctx:expr, @rate $rate:expr) => {{
+        use $crate::Supervisor as _;
+        const SITE: $crate::Site = $crate::Site {
+            file: ::core::file!(),
+            line: ::core::line!(),
+            column: ::core::column!(),
+        };
+        ($ctx).buggify(&SITE, $rate)
+    }};
+    ($ctx:expr, $rate:expr) => {
+        $crate::buggify!($ctx, @rate ::core::option::Option::Some($rate))
+    };
+}

@@ -508,6 +508,14 @@ macro_rules! forward_context {
                     $field: self.$field,
                 }
             }
+
+            fn buggify(
+                &self,
+                site: &$crate::Site,
+                rate: Option<commonware_utils::Probability>,
+            ) -> bool {
+                self.inner.buggify(site, rate)
+            }
         }
 
         impl<E: Clock> Clock for $wrapper<E> {

@@ -11,6 +11,7 @@ use commonware_runtime::{
         Write,
         paged::{CHECKSUM_SIZE, CacheRef, Recovery as PagedRecovery},
     },
+    buggify,
     telemetry::metrics::{Counter, Gauge, GaugeExt, MetricsExt as _},
 };
 use futures::future::{join_all, try_join_all};
@@ -366,13 +367,21 @@ impl<E: Storage + Metrics, F: BufferFactory<E::Blob>> Manager<E, F> {
         for &section in &sections {
             self.prune_guard(section)?;
         }
+        let context = &self.context;
+        let mut count = 0;
         let futures: Vec<_> = self
             .blobs
             .iter_mut()
-            .filter(|(section, _)| sections.contains(section))
+            .filter(|(section, _)| {
+                if sections.contains(section) {
+                    count += 1;
+                    return true;
+                }
+                // Making unselected sections durable early is always allowed.
+                buggify!(context)
+            })
             .map(|(_, blob)| blob.sync())
             .collect();
-        let count = futures.len() as u64;
         try_join_all(futures).await.map_err(Error::Runtime)?;
         self.synced.inc_by(count);
         Ok(())
