@@ -501,9 +501,15 @@ impl<E: Context, A: CodecFixedShared> Recovery<E, A> {
             let required_items = ceiling
                 .saturating_sub(first_in_blob(pruning_boundary, blob, items_per_blob)?)
                 .min(items_per_blob);
+            // A bounded scan reads through the end of the page holding the cap: if that page
+            // is a valid partial page with data after it, reads of the capped prefix would
+            // reject it as a partial interior page, so the hole above the cap must be trimmed.
+            let page_size = u64::from(cfg.page_cache.page_size().get());
             let limit = if max_size.is_some() {
                 required_items
                     .saturating_mul(Inner::<E, A>::CHUNK_SIZE_U64)
+                    .div_ceil(page_size)
+                    .saturating_mul(page_size)
                     .min(writer.size())
             } else {
                 writer.size()
@@ -518,7 +524,9 @@ impl<E: Context, A: CodecFixedShared> Recovery<E, A> {
                 .await?;
             let valid_items = recoverable / Inner::<E, A>::CHUNK_SIZE_U64;
             let valid = Inner::<E, A>::items_to_bytes(valid_items)?;
-            if valid == writer.size() || (max_size.is_some() && valid_items >= required_items) {
+            if valid == writer.size()
+                || (max_size.is_some() && valid_items >= required_items && recoverable == limit)
+            {
                 continue;
             }
 
