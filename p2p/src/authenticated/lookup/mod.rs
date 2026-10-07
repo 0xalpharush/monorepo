@@ -2960,3 +2960,99 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod dst {
+    //! Fault campaigns for lookup over the deterministic runtime's sockets.
+
+    use super::*;
+    use crate::{
+        AddressableManager as _,
+        authenticated::dst::{self, Variant},
+        simulated::sockets,
+    };
+    use commonware_cryptography::{Signer as _, ed25519};
+    use commonware_macros::{test_group, test_traced};
+    use commonware_runtime::{Quota, deterministic};
+    use std::time::Duration;
+    use commonware_utils::NZU32;
+
+    struct Lookup;
+
+    impl Variant for Lookup {
+        type Oracle = Oracle<ed25519::PublicKey>;
+
+        fn start(
+            context: deterministic::Context,
+            signers: &[ed25519::PrivateKey],
+            i: usize,
+            _bootstrappers: usize,
+        ) -> (dst::Sender, dst::Receiver, Self::Oracle) {
+            let config = Config::test(signers[i].clone(), sockets::address(i), 1_024 * 1_024);
+            let (mut network, oracle) = Network::new(context, config);
+            let (sender, receiver) = network.register(0, Quota::per_second(NZU32!(1_000)));
+            network.start();
+            (sender, receiver, oracle)
+        }
+
+        fn track(
+            oracle: &mut Self::Oracle,
+            signers: &[ed25519::PrivateKey],
+            index: u64,
+            members: &[usize],
+        ) {
+            let peers = sockets::peers(signers.iter().map(|s| s.public_key()));
+            let members: Vec<_> = members
+                .iter()
+                .map(|&j| {
+                    let key = signers[j].public_key();
+                    let address = peers.get_value(&key).unwrap().clone();
+                    (key, address)
+                })
+                .collect();
+            oracle.track(index, commonware_utils::ordered::Map::try_from(members).unwrap());
+        }
+    }
+
+    /// Two peers that start dialing each other at the same moment over 150ms links never
+    /// connect: each rejects the other's inbound connection while it holds a reservation for its
+    /// own outbound dial, both dials fail at the same moment, and both redial together (the
+    /// jitter on the next dial is drawn from the reservation time, so it is spent while a
+    /// handshake longer than twice the connection cooldown is in flight).
+    #[test]
+    #[ignore = "bug: simultaneous dials livelock when a handshake outlasts the cooldown jitter"]
+    fn test_dst_simultaneous_dials() {
+        for seed in 0..5 {
+            dst::connect_simultaneously::<Lookup>(
+                seed,
+                2,
+                Duration::from_millis(150),
+                Duration::from_secs(120),
+            );
+        }
+    }
+
+    #[test]
+    fn test_dst_campaign() {
+        dst::sweep::<Lookup>(0..8);
+    }
+
+    #[test_group("slow")]
+    #[test]
+    fn test_dst_campaign_slow() {
+        dst::sweep::<Lookup>(0..100);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_dst_campaign_env() {
+        dst::sweep::<Lookup>(dst::env_seeds());
+    }
+
+    #[test_traced("WARN")]
+    #[ignore]
+    fn test_dst_seed() {
+        let seed: u64 = std::env::var("DST_SEED").unwrap().parse().unwrap();
+        dst::run::<Lookup>(seed, dst::Scenario::random(seed));
+    }
+}

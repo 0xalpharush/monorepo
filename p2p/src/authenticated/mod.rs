@@ -13,6 +13,8 @@ mod data;
 pub use crate::sizing::peer_set_limit;
 pub use data::{MAX_PAYLOAD_OVERHEAD, max_size};
 pub(crate) mod dialing;
+#[cfg(test)]
+mod dst;
 pub mod discovery;
 pub mod lookup;
 mod mailbox;
