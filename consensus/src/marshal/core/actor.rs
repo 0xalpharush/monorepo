@@ -2073,6 +2073,26 @@ where
                 ?digest,
                 "dropping finalization at or below processed height floor"
             );
+            // A crash can leave a processed block durable without its finalization (the two
+            // archives sync independently). Store a finalization reported for it again so the
+            // archive (and the latest finalized height) catches up.
+            if let Some(finalization) = finalization
+                && !self.has_finalization_by_height(height).await
+            {
+                let round = finalization.round();
+                self.finalizations_by_height = self
+                    .finalizations_by_height
+                    .put(height, digest, &finalization)
+                    .await
+                    .unwrap_or_else(|e| panic!("failed to finalize: {e}"));
+                self = self.sync_finalized().await;
+                if height > self.tip {
+                    application.report(Update::Tip(round, height, digest));
+                    self.tip = height;
+                    self.certified.retain(height.next());
+                    let _ = self.finalized_height.try_set(height.get());
+                }
+            }
             return (self, false);
         }
 
