@@ -94,12 +94,14 @@ where
         let names: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
         let mut hosts = Hosts::new(&context);
         let mut reporters = Vec::new();
+        let mut contexts = Vec::new();
         for (idx, participant) in fixture.participants.iter().enumerate() {
             let (reporter, mailbox) =
                 mocks::Reporter::new(context.child("reporter"), fixture.verifier.clone());
             reporter.start();
             reporters.push(mailbox.clone());
             let host = hosts.start(&names[idx], HostConfig::new());
+            contexts.push(host.child("probe"));
             start_engine(
                 host,
                 &fixture,
@@ -118,6 +120,7 @@ where
             ($idx:expr) => {{
                 let idx = $idx;
                 let host = hosts.restart(&names[idx]);
+                contexts[idx] = host.child("probe");
                 let registration = oracle
                     .control(fixture.participants[idx].clone())
                     .register(0, TEST_QUOTA)
@@ -191,7 +194,15 @@ where
             }
             assert!(
                 context.current() < deadline,
-                "no liveness after recovery: before {before:?}, now {now:?}, target {target}, running {:?}, starts {:?}",
+                "no liveness after recovery: before {before:?}, now {now:?}, target {target}, engine tips {:?}, running {:?}, starts {:?}",
+                contexts
+                    .iter()
+                    .map(|context| context
+                        .encode()
+                        .lines()
+                        .find(|line| line.starts_with("engine_tip "))
+                        .map(str::to_string))
+                    .collect::<Vec<_>>(),
                 hosts.running(),
                 names.iter().map(|name| hosts.starts(name)).collect::<Vec<_>>()
             );
@@ -342,4 +353,20 @@ fn test_replay_advances_tip_over_journaled_certificates() {
             context.sleep(Duration::from_millis(100)).await;
         }
     });
+}
+
+/// Campaign seed 18 (sweep parameters): after a validator's tip is fast-forwarded to the safe
+/// tip of its peers onto a height it had already certified, nothing advances it further, and once
+/// a quorum is stuck that way the cluster stops certifying.
+#[test_traced("WARN")]
+#[ignore = "finding: fast-forwarding the tip onto a certified height stalls it"]
+fn test_host_campaign_seed_18_fast_forward_onto_certified_height() {
+    host_campaign(
+        18,
+        10,
+        Probability::new(4, 500).unwrap(),
+        Probability::new(18, 100).unwrap(),
+        PartialWriteMode::Prefix,
+        ed25519::fixture,
+    );
 }
