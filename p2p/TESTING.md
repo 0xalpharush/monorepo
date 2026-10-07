@@ -34,6 +34,6 @@ oracle.add_link(pk1, pk2, Link {
 
 ## Adversarial scenarios
 
-Exercise partitions, latency, jitter, and loss when they affect the protocol. Use `oracle.set_link_faults` with `LinkFaults` to duplicate (stale replays) or corrupt messages, or `oracle.set_policy` to decide every message with a `NetworkPolicy`. For Byzantine tests, substitute the relevant mock actor and verify the expected fault or block outcome.
+Exercise partitions, latency, jitter, and loss when they affect the protocol. Use `oracle.set_link_faults` with `LinkFaults` to duplicate (stale replays) or corrupt messages, or `oracle.set_policy` to decide every message with a `NetworkPolicy`. For partitions (including one-way cuts) and clogs that change mid-run, install a `deterministic::Partitions` (over a seeded `deterministic::Jitter`) and drive it directly or with `deterministic::Swizzle`. For Byzantine tests, substitute the relevant mock actor and verify the expected fault or block outcome.
 
 Monitor progress with supervisors or metrics rather than time alone. Run a scenario twice with the same seed when its state is meant to be deterministic.

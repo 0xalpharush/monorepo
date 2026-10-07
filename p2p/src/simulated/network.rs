@@ -947,6 +947,7 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
                     channel: Some(channel),
                     index,
                     len: message.len(),
+                    at: now,
                 }),
                 None => Self::sample_delivery(self.context.as_mut(), link, message.len()),
             };

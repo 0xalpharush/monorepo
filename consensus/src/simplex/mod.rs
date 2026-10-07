@@ -7889,6 +7889,278 @@ mod tests {
         })
     }
 
+    /// Starts a validator's application and engine from `context` (the context of the
+    /// validator's process), reporting to `reporter`.
+    #[allow(clippy::too_many_arguments)]
+    fn start_nemesis_validator<S, L>(
+        context: &deterministic::Context,
+        oracle: &Oracle<PublicKey, deterministic::Context>,
+        relay: &Arc<mocks::relay::Relay<Sha256Digest, PublicKey>>,
+        validator: &PublicKey,
+        scheme: S,
+        elector: L,
+        reporter: mocks::reporter::Reporter<deterministic::Context, S, L, Sha256Digest>,
+        registration: TestRegistration,
+    ) -> commonware_runtime::Handle<()>
+    where
+        S: Scheme<Sha256Digest, PublicKey = PublicKey>,
+        L: elector::Config<S>,
+    {
+        let application_cfg = mocks::application::Config::<Sha256, _> {
+            relay: relay.clone(),
+            me: validator.clone(),
+            propose_latency: (10.0, 5.0),
+            verify_latency: (10.0, 5.0),
+            certify_latency: (10.0, 5.0),
+            should_certify: mocks::application::Certifier::Always,
+        };
+        let (actor, application) =
+            mocks::application::Application::new(context.child("application"), application_cfg);
+        actor.start();
+        let cfg = config::Config {
+            scheme,
+            elector,
+            blocker: oracle.control(validator.clone()),
+            automaton: application.clone(),
+            relay: application,
+            reporter,
+            strategy: Sequential,
+            partition: validator.to_string(),
+            mailbox_size: NZUsize!(1024),
+            epoch: Epoch::new(333),
+            floor: config::Floor::Genesis(mocks::application::genesis::<Sha256>(Epoch::new(
+                333,
+            ))),
+            leader_timeout: Duration::from_secs(1),
+            certification_timeout: Duration::from_secs(2),
+            timeout_retry: Duration::from_secs(10),
+            fetch_timeout: Duration::from_secs(1),
+            view_retention: ViewDelta::new(10),
+            skip: SkipPolicy::Enabled {
+                timeout: Duration::from_secs(11),
+                budget: SkipBudget::Participants,
+            },
+            replay_buffer: NZUsize!(1024 * 1024),
+            write_buffer: NZUsize!(1024 * 1024),
+            page_cache: CacheRef::from_pooler(context, PAGE_SIZE, PAGE_CACHE_SIZE),
+            forward: ForwardPolicy::Disabled,
+            track_historical_votes: false,
+        };
+        let (pending, recovered, resolver) = registration;
+        Engine::new(context.child("engine"), cfg).start(pending, recovered, resolver)
+    }
+
+    /// Waits until every reporter has observed view `target`.
+    async fn await_view<S, L>(
+        context: &deterministic::Context,
+        reporters: &mut [mocks::reporter::Reporter<deterministic::Context, S, L, Sha256Digest>],
+        target: View,
+    ) where
+        S: Scheme<Sha256Digest, PublicKey = PublicKey>,
+        L: elector::Config<S>,
+    {
+        let mut waiters = Vec::new();
+        for reporter in reporters.iter_mut() {
+            let (mut latest, mut monitor) = reporter.subscribe().await;
+            waiters.push(context.child("waiter").spawn(move |_| async move {
+                while latest < target {
+                    latest = monitor.recv().await.expect("event missing");
+                }
+            }));
+        }
+        join_all(waiters).await;
+    }
+
+    /// Runs five validators, each in its own process, through a swizzle-clog of the network
+    /// while a zone of two validators crashes at once and one of them loses all of its data
+    /// before both restart. Checks that finalizations never conflict and that every validator
+    /// (including the one that lost its data) keeps finalizing once the network heals.
+    ///
+    /// Returns the auditor state and the number of faults attributed to the wiped validator
+    /// (which may equivocate, having forgotten its votes).
+    fn swizzle_zone_wipe<S, F, L>(seed: u64, elector: L, mut fixture: F) -> (String, usize)
+    where
+        S: Scheme<Sha256Digest, PublicKey = PublicKey>,
+        F: FnMut(&mut deterministic::Context, &[u8], u32) -> Fixture<S>,
+        L: elector::Config<S>,
+    {
+        let n = 5;
+        let namespace = b"consensus".to_vec();
+        let cfg = deterministic::Config::new()
+            .with_seed(seed)
+            .with_timeout(Some(Duration::from_secs(600)));
+        deterministic::Runner::new(cfg).start(|mut context| async move {
+            let Fixture {
+                participants,
+                schemes,
+                ..
+            } = fixture(&mut context, &namespace, n);
+            let mut oracle =
+                start_test_network_with_peers(context.child("network"), participants.clone(), true)
+                    .await;
+            let mut registrations = register_validators(&mut oracle, &participants).await;
+            let link = Link {
+                latency: Duration::from_millis(10),
+                jitter: Duration::from_millis(1),
+                success_rate: probability!(1.0),
+            };
+            link_validators(&mut oracle, &participants, Action::Link(link), None).await;
+            let partitions = Arc::new(deterministic::Partitions::new(deterministic::Jitter::new(
+                seed,
+                Duration::from_millis(10),
+                Duration::from_millis(5),
+            )));
+            oracle.set_policy(Some(partitions.clone())).await.unwrap();
+
+            // Each validator runs in a process owning its partitions; validators 0 and 1 share
+            // a zone
+            let relay = Arc::new(mocks::relay::Relay::<Sha256Digest, _>::new());
+            let owns = |validator: &PublicKey| {
+                let prefix = validator.to_string();
+                move |partition: &str| partition.starts_with(&prefix)
+            };
+            let mut reporters = Vec::new();
+            let mut zone = deterministic::Zone::new();
+            let mut processes = Vec::new();
+            for (idx, validator) in participants.iter().enumerate() {
+                let reporter = mocks::reporter::Reporter::new(
+                    context.child("reporter"),
+                    mocks::reporter::Config {
+                        participants: participants.clone().try_into().unwrap(),
+                        scheme: schemes[idx].clone(),
+                        elector: elector.clone(),
+                    },
+                );
+                reporters.push(reporter.clone());
+                let (process_ctx, process) = context.process("validator", owns(validator));
+                let process_ctx = process_ctx.with_attribute("public_key", validator);
+                start_nemesis_validator(
+                    &process_ctx,
+                    &oracle,
+                    &relay,
+                    validator,
+                    schemes[idx].clone(),
+                    elector.clone(),
+                    reporter,
+                    registrations.remove(validator).unwrap(),
+                );
+                if idx < 2 {
+                    zone.add(process);
+                } else {
+                    processes.push(process);
+                }
+            }
+            await_view(&context, &mut reporters, View::new(10)).await;
+
+            // Swizzle-clog the whole network while the zone fails
+            let swizzle = context.child("swizzle").spawn({
+                let partitions = partitions.clone();
+                let participants = participants.clone();
+                move |context| async move {
+                    deterministic::Swizzle::new(seed)
+                        .with_gap(Duration::from_millis(750))
+                        .run(&context, &partitions, &participants)
+                        .await
+                }
+            });
+            let mut rng = StdRng::seed_from_u64(seed);
+            context
+                .sleep(Duration::from_millis(rng.random_range(0..2_000)))
+                .await;
+            zone.crash();
+            info!("zone crashed");
+            context
+                .sleep(Duration::from_millis(rng.random_range(0..3_000)))
+                .await;
+            let mut members = zone.into_processes();
+            let survivor = members.pop().unwrap();
+            members.pop().unwrap().wipe();
+            drop(survivor);
+            info!("validator 0 lost its data");
+
+            // Restart the zone: validator 0 starts empty, validator 1 recovers its journal
+            for (idx, validator) in participants.iter().enumerate().take(2) {
+                let (process_ctx, process) =
+                    context.process("validator_restarted", owns(validator));
+                let process_ctx = process_ctx.with_attribute("public_key", validator);
+                let registration = register_validator(&mut oracle, validator.clone()).await;
+                start_nemesis_validator(
+                    &process_ctx,
+                    &oracle,
+                    &relay,
+                    validator,
+                    schemes[idx].clone(),
+                    elector.clone(),
+                    reporters[idx].clone(),
+                    registration,
+                );
+                processes.push(process);
+            }
+
+            // Once the swizzle has released every link, everyone keeps finalizing
+            let steps = swizzle.await.unwrap();
+            info!(?steps, "swizzle done");
+            partitions.heal(&context);
+            let healed = reporters
+                .iter()
+                .map(|reporter| reporter.finalizations.lock().keys().max().copied())
+                .max()
+                .flatten()
+                .unwrap_or(View::zero());
+            await_view(&context, &mut reporters, healed.saturating_add(ViewDelta::new(20))).await;
+
+            // Safety: finalizations agree across validators, and only the wiped validator can
+            // be faulty
+            let mut finalized = BTreeMap::new();
+            for reporter in &reporters {
+                reporter.assert_no_invalid();
+                for (view, (finalization, _)) in reporter.finalizations.lock().iter() {
+                    let digest = finalization.proposal.payload;
+                    assert_eq!(
+                        *finalized.entry(*view).or_insert(digest),
+                        digest,
+                        "conflicting finalizations at view {view}"
+                    );
+                }
+                for faulty in reporter.faults.lock().keys() {
+                    assert_eq!(faulty, &participants[0], "only the wiped validator may be faulty");
+                }
+            }
+            let wiped_faults = reporters
+                .iter()
+                .map(|reporter| {
+                    reporter
+                        .faults
+                        .lock()
+                        .get(&participants[0])
+                        .map_or(0, |faults| faults.values().map(HashSet::len).sum())
+                })
+                .sum();
+            (context.auditor().state(), wiped_faults)
+        })
+    }
+
+    #[test_traced("WARN")]
+    fn test_swizzle_zone_wipe() {
+        let run = |seed| swizzle_zone_wipe::<_, _, RoundRobin>(seed, RoundRobin::default(), ed25519::fixture);
+        let (state, _) = run(0);
+        assert_eq!(state, run(0).0, "runs are deterministic");
+        run(1);
+    }
+
+    #[test_group("slow")]
+    #[test_traced("WARN")]
+    fn test_swizzle_zone_wipe_sweep() {
+        for seed in 0..32 {
+            let (_, faults) = swizzle_zone_wipe::<_, _, RoundRobin>(
+                seed,
+                RoundRobin::default(),
+                ed25519::fixture,
+            );
+            info!(seed, faults, "swizzle zone wipe");
+        }
+    }
+
     // The hailstorm run must be deterministic: two runs with identical inputs
     // must produce identical audit state.
     fn hailstorm<S, F, L>(fixture: F, elector: L)
