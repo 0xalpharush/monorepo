@@ -163,7 +163,11 @@ where
     Key: Span,
 {
     /// Creates a new fetcher.
-    pub fn new(context: E, config: Config<P>) -> Self {
+    pub fn new(mut context: E, config: Config<P>) -> Self {
+        // Start request ids at a random point so that a restarted node does not reuse the ids of
+        // requests it sent before the restart: a peer's late response to one of those would
+        // otherwise answer a new request with another key's data.
+        let request_id = context.next_u64();
         let performance = context.family(
             "peer_performance",
             "Per-peer performance (exponential moving average of throughput in bytes per second)",
@@ -184,7 +188,7 @@ where
             me: config.me,
             blocked: HashSet::new(),
             participants: PrioritySet::new(),
-            request_id: 0,
+            request_id,
             active: PrioritySet::new(),
             requests: HashMap::new(),
             key_to_id: HashMap::new(),
