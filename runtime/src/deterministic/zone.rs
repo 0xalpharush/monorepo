@@ -33,7 +33,7 @@ impl Process {
             .inner()
             .inner()
             .inner()
-            .erase_partitions(&self.host.partitions);
+            .erase_partitions(&|partition| (self.host.partitions)(partition));
         self.executor().auditor.event(b"wipe_process", |hasher| {
             for partition in &erased {
                 hasher.update(partition.as_bytes());
