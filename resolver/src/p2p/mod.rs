@@ -4451,4 +4451,114 @@ mod tests {
             clean_shutdown(seed);
         }
     }
+
+    /// A producer that answers each key after a fixed delay.
+    #[derive(Clone)]
+    struct DelayedProducer {
+        context: Arc<deterministic::Context>,
+        data: HashMap<Key, (Duration, Bytes)>,
+    }
+
+    impl crate::p2p::Producer for DelayedProducer {
+        type Key = Key;
+
+        fn produce(&mut self, key: Key) -> oneshot::Receiver<Bytes> {
+            let (sender, receiver) = oneshot::channel();
+            if let Some((delay, value)) = self.data.get(&key).cloned() {
+                self.context
+                    .child("delayed_produce")
+                    .spawn(move |context| async move {
+                        context.sleep(delay).await;
+                        sender.send_lossy(value);
+                    });
+            }
+            receiver
+        }
+    }
+
+    /// A peer's response to a request sent before the requester restarted must not be taken as
+    /// the response to a request the restarted requester sent since.
+    ///
+    /// Request ids start at zero in every engine, so the restarted requester reuses the id of
+    /// its pre-crash request; the late response then answers the new request with the old key's
+    /// data, which the consumer rejects, and the requester blocks the honest peer. Once it has
+    /// blocked every peer this way, a restarted node can no longer fetch anything (as observed
+    /// in a marshal crash/restart campaign, coding seed 12).
+    #[test_traced]
+    #[ignore = "finding: request ids restart at zero, so stale responses answer new requests"]
+    fn test_stale_response_after_restart_does_not_block_peer() {
+        let executor = deterministic::Runner::timed(Duration::from_secs(10));
+        executor.start(|context| async move {
+            let (mut oracle, mut schemes, peers, mut connections) =
+                setup_network_and_peers(&context, &[1, 2]).await;
+            add_link(&mut oracle, LINK.clone(), &peers, 0, 1).await;
+
+            // Peer 2 answers key 1 slowly and key 2 more slowly (both within the timeout)
+            let mut data = HashMap::new();
+            data.insert(Key(1), (Duration::from_millis(300), Bytes::from("data for key 1")));
+            data.insert(Key(2), (Duration::from_millis(350), Bytes::from("data for key 2")));
+            let scheme2 = schemes.remove(1);
+            let _mailbox2 = setup_and_spawn_actor_with_producer(
+                &context,
+                oracle.manager(),
+                oracle.control(scheme2.public_key()),
+                scheme2,
+                connections.remove(1),
+                dummy_consumer(),
+                DelayedProducer {
+                    context: Arc::new(context.child("producer")),
+                    data,
+                },
+            );
+
+            // Peer 1 requests key 1, then crashes before the response arrives
+            let scheme1 = schemes.remove(0);
+            let (host, process) = context.host("peer1", deterministic::HostConfig::new());
+            let (consumer1, _) = consumer();
+            let mut mailbox1 = setup_and_spawn_actor(
+                &host,
+                oracle.manager(),
+                oracle.control(scheme1.public_key()),
+                scheme1.clone(),
+                connections.remove(0),
+                consumer1,
+                Producer::default(),
+            );
+            mailbox1.fetch(Key(1));
+            context.sleep(Duration::from_millis(100)).await;
+            process.crash();
+
+            // The restarted peer 1 requests key 2 from peer 2
+            let connection = oracle
+                .control(scheme1.public_key())
+                .register(0, Quota::per_second(RATE_LIMIT))
+                .await
+                .unwrap();
+            let (host, _process) = context.host("peer1", deterministic::HostConfig::new());
+            let (mut consumer1, mut delivered) = consumer();
+            consumer1.add_expected(Key(2), Bytes::from("data for key 2"));
+            let mut mailbox1 = setup_and_spawn_actor(
+                &host,
+                oracle.manager(),
+                oracle.control(scheme1.public_key()),
+                scheme1.clone(),
+                connection,
+                consumer1,
+                Producer::default(),
+            );
+            mailbox1.fetch(Key(2));
+
+            context.sleep(Duration::from_secs(2)).await;
+            let blocked = oracle.blocked().await.unwrap();
+            assert!(
+                !blocked
+                    .iter()
+                    .any(|(a, b)| a == &scheme1.public_key() && b == &peers[1]),
+                "the restarted peer blocked an honest peer for a stale response: {blocked:?}"
+            );
+            let (key, value) = delivered.recv().await.unwrap();
+            assert_eq!(key, Key(2));
+            assert_eq!(value, Bytes::from("data for key 2"));
+        });
+    }
 }
