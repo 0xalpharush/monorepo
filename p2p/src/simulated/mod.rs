@@ -3826,7 +3826,10 @@ mod tests {
         for a in &keys {
             for b in &keys {
                 if a != b {
-                    oracle.add_link(a.clone(), b.clone(), FAULT_LINK).await.unwrap();
+                    oracle
+                        .add_link(a.clone(), b.clone(), FAULT_LINK)
+                        .await
+                        .unwrap();
                 }
             }
         }
@@ -3896,7 +3899,12 @@ mod tests {
             let (keys, mut senders, mut log) =
                 start_partitioned_network(&context, 2, partitions.clone()).await;
             let start = context.current();
-            partitions.clog(&context, keys[0].clone(), keys[1].clone(), Duration::from_secs(1));
+            partitions.clog(
+                &context,
+                keys[0].clone(),
+                keys[1].clone(),
+                Duration::from_secs(1),
+            );
             for i in 0u8..5 {
                 senders[0].send(Recipients::One(keys[1].clone()), vec![i], false);
                 senders[1].send(Recipients::One(keys[0].clone()), vec![i], false);
@@ -3923,9 +3931,12 @@ mod tests {
     fn swizzled(seed: u64) -> (String, Vec<Delivery>) {
         let executor = deterministic::Runner::seeded(seed);
         executor.start(|context| async move {
-            let partitions = std::sync::Arc::new(deterministic::Partitions::new(
-                deterministic::Jitter::new(seed, Duration::from_millis(5), Duration::from_millis(5)),
-            ));
+            let partitions =
+                std::sync::Arc::new(deterministic::Partitions::new(deterministic::Jitter::new(
+                    seed,
+                    Duration::from_millis(5),
+                    Duration::from_millis(5),
+                )));
             let size = 4;
             let (keys, senders, mut log) =
                 start_partitioned_network(&context, size, partitions.clone()).await;

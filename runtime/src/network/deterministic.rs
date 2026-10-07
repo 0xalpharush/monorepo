@@ -387,9 +387,7 @@ impl crate::Network for Network {
 
     async fn dial(&self, socket: SocketAddr) -> Result<(Sink, Stream), Error> {
         // Assign dialer a port from the ephemeral range on its source IP
-        let source = DIAL_SOURCE
-            .get()
-            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let source = DIAL_SOURCE.get().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let dialer = {
             let mut ephemeral = self.ephemeral.lock();
             let dialer = SocketAddr::new(source, *ephemeral);

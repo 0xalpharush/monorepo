@@ -124,17 +124,13 @@ impl Zone {
 mod tests {
     use super::*;
     use crate::{
-        Blob as _, Clock as _, Runner as _, Spawner as _, Storage as _, WriteOptions,
-        deterministic,
+        Blob as _, Clock as _, Runner as _, Spawner as _, Storage as _, WriteOptions, deterministic,
     };
     use commonware_utils::sync::Mutex;
     use std::{sync::Arc, time::Duration};
 
     /// Spawns a task in each of `count` processes of a zone that counts how often each one ticks.
-    fn start_zone(
-        context: &deterministic::Context,
-        count: usize,
-    ) -> (Zone, Arc<Mutex<Vec<u64>>>) {
+    fn start_zone(context: &deterministic::Context, count: usize) -> (Zone, Arc<Mutex<Vec<u64>>>) {
         let ticks = Arc::new(Mutex::new(vec![0u64; count]));
         let mut zone = Zone::new();
         for i in 0..count {
@@ -199,14 +195,20 @@ mod tests {
                 let (node, process) = context.process("node", owned);
                 for partition in ["node_a", "node_b"] {
                     let (blob, _) = node.open(partition, b"blob").await.unwrap();
-                    blob.write_at(0, b"synced".to_vec(), WriteOptions::default()).await.unwrap();
+                    blob.write_at(0, b"synced".to_vec(), WriteOptions::default())
+                        .await
+                        .unwrap();
                     blob.sync().await.unwrap();
-                    blob.write_at(6, b"unsynced".to_vec(), WriteOptions::default()).await.unwrap();
+                    blob.write_at(6, b"unsynced".to_vec(), WriteOptions::default())
+                        .await
+                        .unwrap();
                     drop(blob);
                 }
                 let (other, _bystander) = context.process("other", |p| p == "other");
                 let (blob, _) = other.open("other", b"blob").await.unwrap();
-                blob.write_at(0, b"kept".to_vec(), WriteOptions::default()).await.unwrap();
+                blob.write_at(0, b"kept".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
                 blob.sync().await.unwrap();
                 drop(blob);
 
@@ -235,7 +237,9 @@ mod tests {
             for partition in ["zone_0", "zone_1"] {
                 let (node, process) = context.process("node", move |p| p == partition);
                 let (blob, _) = node.open(partition, b"blob").await.unwrap();
-                blob.write_at(0, b"data".to_vec(), WriteOptions::default()).await.unwrap();
+                blob.write_at(0, b"data".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
                 blob.sync().await.unwrap();
                 drop(blob);
                 zone.add(process);
@@ -254,7 +258,9 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let (node, process) = context.process("node", |p| p == "data");
             let (blob, _) = node.open("data", b"blob").await.unwrap();
-            blob.write_at(0, b"data".to_vec(), WriteOptions::default()).await.unwrap();
+            blob.write_at(0, b"data".to_vec(), WriteOptions::default())
+                .await
+                .unwrap();
             blob.sync().await.unwrap();
             drop(blob);
             let mut zone = Zone::new();

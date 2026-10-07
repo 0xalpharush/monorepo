@@ -10,10 +10,7 @@
 //! Every change is recorded by the [super::Auditor], and every random choice is drawn from a
 //! seeded RNG owned by the helper that makes it, so a run is reproducible from its seeds.
 
-use super::{
-    Context, NetworkDelivery, NetworkPolicy, NetworkTransmission, Process,
-    ProcessState,
-};
+use super::{Context, NetworkDelivery, NetworkPolicy, NetworkTransmission, Process, ProcessState};
 use crate::Clock;
 use commonware_utils::{Probability, sync::Mutex};
 use rand::{RngExt as _, SeedableRng, prelude::SliceRandom, rngs::StdRng};
@@ -273,10 +270,7 @@ impl<A, H: Ord + Clone + Debug + Send> Partitions<A, H> {
 
     /// Whether the link from `from` to `to` is cut.
     pub fn is_cut(&self, from: &H, to: &H) -> bool {
-        self.state
-            .lock()
-            .cuts
-            .contains(&(from.clone(), to.clone()))
+        self.state.lock().cuts.contains(&(from.clone(), to.clone()))
     }
 
     /// When traffic sent now from `from` to `to` would be released, if the link is clogged.
@@ -486,7 +480,10 @@ impl Process {
         let mut sources = SOURCES.lock();
         sources.retain(|(process, _)| process.strong_count() > 0);
         let state = &self.host.state;
-        match sources.iter_mut().find(|(process, _)| ptr_eq(process, state)) {
+        match sources
+            .iter_mut()
+            .find(|(process, _)| ptr_eq(process, state))
+        {
             Some((_, source)) => *source = ip,
             None => sources.push((Arc::downgrade(state), ip)),
         }
@@ -665,7 +662,11 @@ mod tests {
 
             // Clog 2 -> 3 for a second: sends stall until the clog clears, then arrive in order
             partitions.clog(&context, host(2), host(3), Duration::from_secs(1));
-            assert!(partitions.clogged_until(&context, &host(2), &host(3)).is_some());
+            assert!(
+                partitions
+                    .clogged_until(&context, &host(2), &host(3))
+                    .is_some()
+            );
             let start = context.current();
             sink.send(b"a".to_vec()).await.unwrap();
             sink.send(b"b".to_vec()).await.unwrap();
@@ -675,7 +676,11 @@ mod tests {
                 Duration::from_secs(1) + Duration::from_millis(5) + Duration::from_millis(5)
             );
             assert_eq!(stream.recv(2).await.unwrap().coalesce(), b"ab");
-            assert!(partitions.clogged_until(&context, &host(2), &host(3)).is_none());
+            assert!(
+                partitions
+                    .clogged_until(&context, &host(2), &host(3))
+                    .is_none()
+            );
         });
     }
 
