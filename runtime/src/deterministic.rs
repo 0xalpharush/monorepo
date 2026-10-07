@@ -1323,8 +1323,6 @@ pub struct Context {
     storage_buffer_pool: BufferPool,
     tree: Arc<Tree>,
     process: Option<Arc<ProcessState>>,
-    /// The host the context belongs to, if any (see [Context::host]).
-    host: Option<Arc<HostScope>>,
     execution: Execution,
 }
 
@@ -1419,7 +1417,6 @@ impl Context {
                 storage_buffer_pool,
                 tree: Tree::root(),
                 process: None,
-                host: None,
                 execution: Execution::default(),
             },
             executor,
@@ -1513,7 +1510,6 @@ impl Context {
                 storage_buffer_pool,
                 tree: Tree::root(),
                 process: None,
-                host: None,
                 execution: Execution::default(),
             },
             executor,
@@ -1768,7 +1764,7 @@ impl Context {
         let context = crate::Supervisor::child(self, label);
 
         // Within a host, the selector sees the partition names the host's applications use
-        let partitions: Arc<dyn Fn(&str) -> bool + Send + Sync> = match &self.host {
+        let partitions: Arc<dyn Fn(&str) -> bool + Send + Sync> = match self.host_scope() {
             Some(host) => {
                 let namespace = host.namespace.clone();
                 Arc::new(move |partition: &str| {
@@ -1779,7 +1775,15 @@ impl Context {
             }
             None => Arc::new(partitions),
         };
-        self.start_process(context, partitions, None)
+        let scope = self.host_scope().cloned();
+        self.start_process(context, partitions, None, scope)
+    }
+
+    /// The host the context belongs to, if any (see [Context::host]).
+    fn host_scope(&self) -> Option<&Arc<HostScope>> {
+        self.process
+            .as_ref()
+            .and_then(|process| process.scope.as_ref())
     }
 
     /// Start a simulated process from `context` that owns every partition `partitions` selects
@@ -1789,6 +1793,7 @@ impl Context {
         mut context: Self,
         partitions: Arc<dyn Fn(&str) -> bool + Send + Sync>,
         ip: Option<IpAddr>,
+        scope: Option<Arc<HostScope>>,
     ) -> (Self, Process) {
         let state = Arc::new(ProcessState {
             parent: context.process.take(),
@@ -1797,6 +1802,7 @@ impl Context {
             contain: AtomicBool::new(false),
             panic: Mutex::new(None),
             ip: Mutex::new(ip),
+            scope,
         });
         context.process = Some(Arc::clone(&state));
         let host = Arc::new(ProcessHost {
@@ -1807,7 +1813,6 @@ impl Context {
             crashed: AtomicBool::new(false),
             disk_full: AtomicBool::new(false),
             latency: Mutex::new(None),
-            scope: context.host.clone(),
         });
         self.executor().processes.lock().push(Arc::clone(&host));
         let process = Process {
@@ -1831,7 +1836,6 @@ impl Context {
             storage_buffer_pool: self.storage_buffer_pool.clone(),
             tree,
             process: self.process.clone(),
-            host: self.host.clone(),
             execution: Execution::default(),
         }
     }
@@ -2054,8 +2058,6 @@ struct ProcessHost {
     /// Range each operation on the process's partitions draws its latency from, overriding
     /// [FaultConfig::latency] (see [Process::set_storage_latency]).
     latency: Mutex<Option<Range<Duration>>>,
-    /// The host of the process's context, if any.
-    scope: Option<Arc<HostScope>>,
 }
 
 impl ProcessHost {
@@ -2235,6 +2237,8 @@ struct ProcessState {
     panic: Mutex<Option<String>>,
     /// The source IP of the process's dials, if set (see [Process::set_ip]).
     ip: Mutex<Option<IpAddr>>,
+    /// The host the process belongs to (the nearest one it was started in), if any.
+    scope: Option<Arc<HostScope>>,
 }
 
 /// Parts per million in a whole.
@@ -2410,7 +2414,7 @@ impl crate::Metrics for Context {
             }
         });
         let metric = Arc::new(metric);
-        let (registry, prefix) = self.host.as_ref().map_or_else(
+        let (registry, prefix) = self.host_scope().map_or_else(
             || (&executor.registry, self.name.as_str()),
             |host| (&host.registry, host.relative(&self.name)),
         );
@@ -2425,7 +2429,7 @@ impl crate::Metrics for Context {
     fn encode(&self) -> String {
         let executor = self.executor();
         executor.auditor.event(b"encode", |_| {});
-        self.host.as_ref().map_or_else(
+        self.host_scope().map_or_else(
             || executor.registry.encode(),
             |host| host.registry.encode(),
         )

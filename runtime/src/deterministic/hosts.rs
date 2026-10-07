@@ -149,16 +149,17 @@ impl Context {
     /// Panics if `name` is not a valid label (it must start with `[a-zA-Z]` and contain only
     /// `[a-zA-Z0-9_]`), or if `cfg` sets an IP another host already has.
     pub fn host(&self, name: &str, cfg: HostConfig) -> (Self, Process) {
-        let mut context = self.child_named(name);
+        let context = self.child_named(name);
         let namespace = format!(
             "{}{name}-",
-            self.host.as_ref().map_or("", |host| host.namespace.as_str())
+            self.host_scope()
+                .map_or("", |host| host.namespace.as_str())
         );
-        context.host = Some(Arc::new(HostScope {
+        let scope = Arc::new(HostScope {
             label: context.name.clone(),
             namespace: namespace.clone(),
             registry: Registry::new(),
-        }));
+        });
 
         // Hosts keep their address across restarts
         let ip = {
@@ -190,6 +191,7 @@ impl Context {
             context,
             Arc::new(move |partition: &str| partition.starts_with(namespace.as_str())),
             Some(ip),
+            Some(scope),
         );
         if let Some(offset) = cfg.clock_offset {
             process.set_clock_offset(offset);
@@ -205,7 +207,7 @@ impl Context {
 
     /// The runtime's name for the partition the context's applications name `partition`.
     pub(super) fn host_partition<'a>(&self, partition: &'a str) -> Result<Cow<'a, str>, Error> {
-        let Some(host) = &self.host else {
+        let Some(host) = self.host_scope() else {
             return Ok(Cow::Borrowed(partition));
         };
         validate_partition_name(partition)?;
@@ -214,7 +216,7 @@ impl Context {
 
     /// `error` with partitions named as the context's applications name them.
     pub(super) fn host_error(&self, error: Error) -> Error {
-        match &self.host {
+        match self.host_scope() {
             Some(host) => host.error(error),
             None => error,
         }
@@ -223,7 +225,7 @@ impl Context {
     /// The address the context reaches by binding or dialing `socket`: within a host, a loopback
     /// or unspecified address is the host's own.
     pub(super) fn host_socket(&self, socket: SocketAddr) -> SocketAddr {
-        if self.host.is_none() || !(socket.ip().is_loopback() || socket.ip().is_unspecified()) {
+        if self.host_scope().is_none() || !(socket.ip().is_loopback() || socket.ip().is_unspecified()) {
             return socket;
         }
         self.source_ip()
@@ -265,7 +267,7 @@ impl Process {
             .inner()
             .inner()
             .durable_blobs(&|partition: &str| (self.host.partitions)(partition));
-        let Some(scope) = &self.host.scope else {
+        let Some(scope) = &self.host.state.scope else {
             return blobs;
         };
         blobs
@@ -355,8 +357,7 @@ impl Hosts {
                 let namespace = format!(
                     "{}{name}-",
                     self.context
-                        .host
-                        .as_ref()
+                        .host_scope()
                         .map_or("", |host| host.namespace.as_str())
                 );
                 let erased = self
