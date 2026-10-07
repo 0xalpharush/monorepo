@@ -244,6 +244,20 @@ stability_scope!(BETA {
         pub attributes: Vec<(String, String)>,
     }
 
+    /// The source location of a [`buggify!`] fault point.
+    ///
+    /// A site is identified by where it appears in the source, so each [`buggify!`] invocation
+    /// is enabled or disabled independently of all others.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Site {
+        /// The file containing the site.
+        pub file: &'static str,
+        /// The line of the site.
+        pub line: u32,
+        /// The column of the site.
+        pub column: u32,
+    }
+
     /// Interface to track task hierarchy and identity.
     pub trait Supervisor: Send + Sync + 'static {
         /// Return the current label prefix and attributes.
@@ -327,6 +341,17 @@ stability_scope!(BETA {
         /// `consensus_engine_votes_total{epoch="$latest_epoch"}`.
         #[must_use]
         fn with_attribute(self, key: &'static str, value: impl std::fmt::Display) -> Self;
+
+        /// Whether the fault point at `site` fires on this evaluation.
+        ///
+        /// Prefer [`buggify!`], which fills in `site`. `rate` is the probability the site
+        /// requests when enabled, or `None` for the runtime's default. Outside simulation, a
+        /// site never fires.
+        #[inline]
+        fn buggify(&self, site: &Site, rate: Option<commonware_utils::Probability>) -> bool {
+            let _ = (site, rate);
+            false
+        }
     }
 
     /// Interface that any task scheduler must implement to spawn tasks.
