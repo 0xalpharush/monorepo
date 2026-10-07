@@ -1817,7 +1817,12 @@ mod tests {
                 info,
                 public_key,
                 ..
-            } = setup_inclusion_harness(&mut context, "redelivered-receipts", NZU64!(4)).await;
+            } = Box::pin(setup_inclusion_harness(
+                &mut context,
+                "redelivered-receipts",
+                NZU64!(4),
+            ))
+            .await;
 
             // Epoch zero spans heights 0..=3 and epoch one spans 4..=7. Each early phase ends one
             // block before its epoch midpoint.
@@ -1897,7 +1902,12 @@ mod tests {
                 info,
                 public_key,
                 ..
-            } = setup_inclusion_harness(&mut context, "inclusion-entry", NZU64!(4)).await;
+            } = Box::pin(setup_inclusion_harness(
+                &mut context,
+                "inclusion-entry",
+                NZU64!(4),
+            ))
+            .await;
 
             // Epoch zero spans heights 0..=3 with its midpoint at 2.
             let mut blocks = vec![Arc::new(mocks::genesis_block(public_key.clone()))];
@@ -1953,7 +1963,12 @@ mod tests {
                 info,
                 public_key,
                 ..
-            } = setup_inclusion_harness(&mut context, "conflicting-redelivery", NZU64!(4)).await;
+            } = Box::pin(setup_inclusion_harness(
+                &mut context,
+                "conflicting-redelivery",
+                NZU64!(4),
+            ))
+            .await;
 
             // Dealing covers genesis and its canonical child, the last block before the midpoint.
             let genesis = Arc::new(mocks::genesis_block(public_key.clone()));
@@ -2009,7 +2024,12 @@ mod tests {
                 info,
                 public_key,
                 ..
-            } = setup_inclusion_harness(&mut context, "skipped-inclusion", NZU64!(6)).await;
+            } = Box::pin(setup_inclusion_harness(
+                &mut context,
+                "skipped-inclusion",
+                NZU64!(6),
+            ))
+            .await;
 
             // Epoch zero spans heights 0..=5 with its midpoint at 3.
             let mut blocks = vec![Arc::new(mocks::genesis_block(public_key.clone()))];
@@ -2060,7 +2080,12 @@ mod tests {
                 info,
                 public_key,
                 ..
-            } = setup_inclusion_harness(&mut context, "unlinked-inclusion", NZU64!(6)).await;
+            } = Box::pin(setup_inclusion_harness(
+                &mut context,
+                "unlinked-inclusion",
+                NZU64!(6),
+            ))
+            .await;
 
             // Epoch zero spans heights 0..=5 with its midpoint at 3.
             let mut blocks = vec![Arc::new(mocks::genesis_block(public_key.clone()))];
@@ -2115,7 +2140,12 @@ mod tests {
                 mut store,
                 public_key,
                 ..
-            } = setup_inclusion_harness(&mut context, "follower-redelivery", NZU64!(4)).await;
+            } = Box::pin(setup_inclusion_harness(
+                &mut context,
+                "follower-redelivery",
+                NZU64!(4),
+            ))
+            .await;
 
             // Epoch zero's final block carries epoch one's public info.
             let participants = Set::from_iter_dedup([public_key.clone()]);
@@ -2202,7 +2232,12 @@ mod tests {
                 mut store,
                 public_key,
                 ..
-            } = setup_inclusion_harness(&mut context, "follower-wrong-epoch", NZU64!(4)).await;
+            } = Box::pin(setup_inclusion_harness(
+                &mut context,
+                "follower-wrong-epoch",
+                NZU64!(4),
+            ))
+            .await;
 
             // Epoch zero's final block carries epoch two's info instead of epoch one's.
             let participants = Set::from_iter_dedup([public_key.clone()]);
@@ -2274,7 +2309,12 @@ mod tests {
                 info,
                 signed_log: _,
                 public_key,
-            } = setup_inclusion_harness(&mut context, "closed-verification", NZU64!(6)).await;
+            } = Box::pin(setup_inclusion_harness(
+                &mut context,
+                "closed-verification",
+                NZU64!(6),
+            ))
+            .await;
 
             // A task context whose owning task has exited rejects descendants
             // with Error::Closed.
@@ -2347,7 +2387,12 @@ mod tests {
                 info,
                 signed_log,
                 public_key,
-            } = setup_inclusion_harness(&mut context, "inclusion-actor", NZU64!(6)).await;
+            } = Box::pin(setup_inclusion_harness(
+                &mut context,
+                "inclusion-actor",
+                NZU64!(6),
+            ))
+            .await;
 
             // Build canonical and detached histories over the same pre-midpoint
             // prefix. Only the detached midpoint carries the dealer log.
@@ -2523,7 +2568,12 @@ mod tests {
                 info,
                 signed_log,
                 public_key,
-            } = setup_inclusion_harness(&mut context, "ready-scan", NZU64!(8)).await;
+            } = Box::pin(setup_inclusion_harness(
+                &mut context,
+                "ready-scan",
+                NZU64!(8),
+            ))
+            .await;
 
             // Build canonical and competing inclusion histories. Only the
             // competing history carries a valid dealer log.
