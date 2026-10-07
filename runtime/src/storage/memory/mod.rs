@@ -215,6 +215,25 @@ impl Storage {
         Some(content[data_offset as usize..].to_vec())
     }
 
+    /// List the blobs of every partition `partitions` selects whose container header resolves,
+    /// as `(partition, name, length)` with the length of the blob's durable logical contents, in
+    /// partition and name order.
+    pub fn durable_blobs(&self, partitions: &impl Fn(&str) -> bool) -> Vec<(String, Vec<u8>, u64)> {
+        let versions = BlobVersion::new(0)..=BlobVersion::new(u16::MAX);
+        let all = self.partitions.lock();
+        all.iter()
+            .filter(|(partition, _)| partitions(partition))
+            .flat_map(|(partition, blobs)| {
+                blobs.iter().filter_map(|(name, content)| {
+                    let (_, _, offset) =
+                        resolve_header(content, &versions, partition, name).ok()??;
+                    let len = (content.len() as u64).checked_sub(offset)?;
+                    Some((partition.clone(), name.clone(), len))
+                })
+            })
+            .collect()
+    }
+
     /// Install durable raw contents without validating the blob's container header.
     pub fn set_raw_blob(&self, partition: &str, name: &[u8], content: Vec<u8>) {
         let key = (partition.to_string(), name.to_vec());

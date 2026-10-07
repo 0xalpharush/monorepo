@@ -1537,6 +1537,20 @@ impl Context {
             .logical_blob(partition, name)
     }
 
+    /// List the blobs of every partition `partitions` selects whose container header resolves,
+    /// as `(partition, name, length)` with the length of the blob's durable logical contents
+    /// (excluding its container header), in partition and name order.
+    ///
+    /// Use this to pick targets for [Self::corrupt_bit] or [Self::misdirect] while their owning
+    /// process is down.
+    pub fn durable_blobs(&self, partitions: impl Fn(&str) -> bool) -> Vec<(String, Vec<u8>, u64)> {
+        self.storage
+            .inner()
+            .inner()
+            .inner()
+            .durable_blobs(&partitions)
+    }
+
     /// Apply `f` to a blob's durable logical contents.
     ///
     /// # Panics
@@ -5450,6 +5464,32 @@ mod tests {
             .coalesce()
             .as_ref()
             .to_vec()
+    }
+
+    #[test]
+    fn test_durable_blobs_lists_logical_lengths() {
+        deterministic::Runner::default().start(|ctx| async move {
+            for (partition, name, len) in [("node_b", &b"two"[..], 3), ("node_a", b"one", 7)] {
+                let (blob, _) = ctx.open(partition, name).await.unwrap();
+                blob.write_at(0, vec![1_u8; len], WriteOptions::SYNC)
+                    .await
+                    .unwrap();
+            }
+            let (blob, _) = ctx.open("other", b"three").await.unwrap();
+            blob.write_at(0, vec![2_u8; 5], WriteOptions::SYNC)
+                .await
+                .unwrap();
+
+            // Only selected partitions are listed, in partition order, with logical lengths.
+            let listed = ctx.durable_blobs(|partition| partition.starts_with("node_"));
+            assert_eq!(
+                listed,
+                vec![
+                    ("node_a".to_string(), b"one".to_vec(), 7),
+                    ("node_b".to_string(), b"two".to_vec(), 3),
+                ]
+            );
+        });
     }
 
     #[test]
