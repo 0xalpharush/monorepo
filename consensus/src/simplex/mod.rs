@@ -8893,4 +8893,6 @@ mod tests {
         assert!(term_edge.admits_vote(View::new(31)));
         assert!(!term_edge.admits_vote(View::new(32)));
     }
+
+    mod hosts_dst;
 }

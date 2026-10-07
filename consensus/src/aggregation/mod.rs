@@ -1260,4 +1260,6 @@ mod tests {
     fn test_1k() {
         run_1k(mocks::scheme::fixture);
     }
+
+    mod hosts_dst;
 }

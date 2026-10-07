@@ -5637,3 +5637,6 @@ pub fn broadcast_caches_block<H: TestHarness>() {
             .expect("block should be cached after broadcast");
     })
 }
+
+#[cfg(test)]
+mod hosts_dst;
