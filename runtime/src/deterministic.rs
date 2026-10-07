@@ -272,6 +272,9 @@ mod scheduling;
 pub use scheduling::{DelayBounded, Pausing, Pct, RandomWalk};
 mod zone;
 pub use zone::Zone;
+mod hosts;
+use hosts::HostScope;
+pub use hosts::{HostConfig, Hosts};
 
 /// Tasks held back by a [SchedulingPolicy].
 #[derive(Default)]
@@ -587,6 +590,8 @@ pub struct Executor {
     shutdown: Mutex<Stopper>,
     panicker: Panicker,
     dns: Mutex<HashMap<String, Vec<IpAddr>>>,
+    /// The IP assigned to each host by name (see [Context::host]), kept across restarts.
+    host_ips: Mutex<BTreeMap<String, IpAddr>>,
 }
 
 impl Executor {
@@ -845,6 +850,7 @@ pub struct Checkpoint {
     network_policy: Option<Arc<dyn NetworkPolicy>>,
     buggify: Option<Arc<Buggify>>,
     dns: Mutex<HashMap<String, Vec<IpAddr>>>,
+    host_ips: Mutex<BTreeMap<String, IpAddr>>,
     catch_panics: bool,
     network_buffer_pool_cfg: BufferPoolConfig,
     storage_buffer_pool_cfg: BufferPoolConfig,
@@ -1103,6 +1109,7 @@ impl Runner {
             storage_fault_cfg,
             storage_fault_policy,
             dns: executor.dns,
+            host_ips: executor.host_ips,
             catch_panics: executor.panicker.catch(),
             network_buffer_pool_cfg,
             storage_buffer_pool_cfg,
@@ -1316,6 +1323,8 @@ pub struct Context {
     storage_buffer_pool: BufferPool,
     tree: Arc<Tree>,
     process: Option<Arc<ProcessState>>,
+    /// The host the context belongs to, if any (see [Context::host]).
+    host: Option<Arc<HostScope>>,
     execution: Execution,
 }
 
@@ -1392,6 +1401,7 @@ impl Context {
             shutdown: Mutex::new(Stopper::default()),
             panicker,
             dns: Mutex::new(HashMap::new()),
+            host_ips: Mutex::new(BTreeMap::new()),
         });
         install_timer(&timer, &executor);
         install_crasher(&storage, &executor);
@@ -1409,6 +1419,7 @@ impl Context {
                 storage_buffer_pool,
                 tree: Tree::root(),
                 process: None,
+                host: None,
                 execution: Execution::default(),
             },
             executor,
@@ -1473,6 +1484,7 @@ impl Context {
             buggify: checkpoint.buggify,
             time: checkpoint.time,
             dns: checkpoint.dns,
+            host_ips: checkpoint.host_ips,
 
             // New state for the new runtime
             registry,
@@ -1501,6 +1513,7 @@ impl Context {
                 storage_buffer_pool,
                 tree: Tree::root(),
                 process: None,
+                host: None,
                 execution: Execution::default(),
             },
             executor,
@@ -1752,22 +1765,49 @@ impl Context {
         label: &'static str,
         partitions: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) -> (Self, Process) {
-        let mut context = crate::Supervisor::child(self, label);
+        let context = crate::Supervisor::child(self, label);
+
+        // Within a host, the selector sees the partition names the host's applications use
+        let partitions: Arc<dyn Fn(&str) -> bool + Send + Sync> = match &self.host {
+            Some(host) => {
+                let namespace = host.namespace.clone();
+                Arc::new(move |partition: &str| {
+                    partition
+                        .strip_prefix(namespace.as_str())
+                        .is_some_and(&partitions)
+                })
+            }
+            None => Arc::new(partitions),
+        };
+        self.start_process(context, partitions, None)
+    }
+
+    /// Start a simulated process from `context` that owns every partition `partitions` selects
+    /// and dials from `ip` (if set).
+    fn start_process(
+        &self,
+        mut context: Self,
+        partitions: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+        ip: Option<IpAddr>,
+    ) -> (Self, Process) {
         let state = Arc::new(ProcessState {
             parent: context.process.take(),
             paused: AtomicBool::new(false),
             clock: Mutex::new(ProcessClock::default()),
             contain: AtomicBool::new(false),
             panic: Mutex::new(None),
+            ip: Mutex::new(ip),
         });
         context.process = Some(Arc::clone(&state));
         let host = Arc::new(ProcessHost {
             state,
             tree: Arc::clone(&context.tree),
             storage: context.storage.clone(),
-            partitions: Arc::new(partitions),
+            partitions,
             crashed: AtomicBool::new(false),
             disk_full: AtomicBool::new(false),
+            latency: Mutex::new(None),
+            scope: context.host.clone(),
         });
         self.executor().processes.lock().push(Arc::clone(&host));
         let process = Process {
@@ -1775,6 +1815,75 @@ impl Context {
             executor: context.executor.clone(),
         };
         (context, process)
+    }
+
+    /// [crate::Supervisor::child] with a label that need not be static.
+    fn child_named(&self, label: &str) -> Self {
+        let (tree, _) = Tree::child(&self.tree);
+        Self {
+            name: child_label(&self.name, label),
+            attributes: self.attributes.clone(),
+            executor: self.executor.clone(),
+            network: self.network.clone(),
+            storage: self.storage.clone(),
+            opens: self.opens.clone(),
+            network_buffer_pool: self.network_buffer_pool.clone(),
+            storage_buffer_pool: self.storage_buffer_pool.clone(),
+            tree,
+            process: self.process.clone(),
+            host: self.host.clone(),
+            execution: Execution::default(),
+        }
+    }
+
+    /// Open a blob in a partition named as the runtime's storage names it.
+    async fn open_partition(
+        &self,
+        partition: &str,
+        name: &[u8],
+        versions: std::ops::RangeInclusive<BlobVersion>,
+    ) -> Result<(Blob, u64, BlobVersion), Error> {
+        // A crash before the namespace lock is taken interrupts the open (and any creation).
+        if self
+            .storage
+            .inner()
+            .inner()
+            .interrupt(partition, Some(name), StorageOp::Open)
+        {
+            return futures::future::pending().await;
+        }
+        let opened = self.opens.open(
+            partition,
+            name,
+            crate::Storage::open_versioned(&*self.storage, partition, name, versions),
+        )?;
+        let retired = self.storage.inner().inner().admit(partition, name);
+        let opened = opened.finish();
+        drop(retired);
+        Ok(opened)
+    }
+
+    /// Remove a blob or partition named as the runtime's storage names it.
+    async fn remove_partition(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
+        let audited = self.storage.inner();
+        // A crash before the namespace lock is taken interrupts the removal.
+        if audited
+            .inner()
+            .interrupt(partition, name, StorageOp::Remove)
+        {
+            return futures::future::pending().await;
+        }
+        let retired = self.opens.remove(
+            partition,
+            name,
+            audited.remove_with(
+                partition,
+                name,
+                audited.inner().remove_retired(partition, name),
+            ),
+        )?;
+        drop(retired);
+        Ok(())
     }
 
     /// Register a DNS mapping for a hostname.
@@ -1942,6 +2051,11 @@ struct ProcessHost {
     partitions: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     crashed: AtomicBool,
     disk_full: AtomicBool,
+    /// Range each operation on the process's partitions draws its latency from, overriding
+    /// [FaultConfig::latency] (see [Process::set_storage_latency]).
+    latency: Mutex<Option<Range<Duration>>>,
+    /// The host of the process's context, if any.
+    scope: Option<Arc<HostScope>>,
 }
 
 impl ProcessHost {
@@ -2119,6 +2233,8 @@ struct ProcessState {
     /// The first contained panic's message; once set, the process's tasks are held back until
     /// a crash drops them.
     panic: Mutex<Option<String>>,
+    /// The source IP of the process's dials, if set (see [Process::set_ip]).
+    ip: Mutex<Option<IpAddr>>,
 }
 
 /// Parts per million in a whole.
@@ -2245,20 +2361,7 @@ fn from_nanos_since_epoch(nanos: i128) -> SystemTime {
 
 impl crate::Supervisor for Context {
     fn child(&self, label: &'static str) -> Self {
-        let (tree, _) = Tree::child(&self.tree);
-        Self {
-            name: child_label(&self.name, label),
-            attributes: self.attributes.clone(),
-            executor: self.executor.clone(),
-            network: self.network.clone(),
-            storage: self.storage.clone(),
-            opens: self.opens.clone(),
-            network_buffer_pool: self.network_buffer_pool.clone(),
-            storage_buffer_pool: self.storage_buffer_pool.clone(),
-            tree,
-            process: self.process.clone(),
-            execution: Execution::default(),
-        }
+        self.child_named(label)
     }
 
     fn with_attribute(mut self, key: &'static str, value: impl std::fmt::Display) -> Self {
@@ -2307,8 +2410,12 @@ impl crate::Metrics for Context {
             }
         });
         let metric = Arc::new(metric);
-        executor.registry.register(
-            prefixed_name(&self.name, &name),
+        let (registry, prefix) = self.host.as_ref().map_or_else(
+            || (&executor.registry, self.name.as_str()),
+            |host| (&host.registry, host.relative(&self.name)),
+        );
+        registry.register(
+            prefixed_name(prefix, &name),
             help,
             self.attributes.clone(),
             metric,
@@ -2318,7 +2425,10 @@ impl crate::Metrics for Context {
     fn encode(&self) -> String {
         let executor = self.executor();
         executor.auditor.event(b"encode", |_| {});
-        executor.registry.encode()
+        self.host.as_ref().map_or_else(
+            || executor.registry.encode(),
+            |host| host.registry.encode(),
+        )
     }
 }
 
@@ -2485,6 +2595,11 @@ impl Crasher for ExecutorCrasher {
         executor.crash_process(&owner);
     }
 
+    fn latency(&self, partition: &str) -> Option<Range<Duration>> {
+        let (_, owner) = self.owner(partition)?;
+        owner.latency.lock().clone()
+    }
+
     fn disk_full(&self, partition: &str) -> bool {
         let any = self
             .0
@@ -2625,13 +2740,14 @@ impl crate::Network for Context {
     type Listener = ListenerOf<Network>;
 
     async fn bind(&self, socket: SocketAddr) -> Result<Self::Listener, Error> {
-        self.network.bind(socket).await
+        self.network.bind(self.host_socket(socket)).await
     }
 
     async fn dial(
         &self,
         socket: SocketAddr,
     ) -> Result<(crate::SinkOf<Self>, crate::StreamOf<Self>), Error> {
+        let socket = self.host_socket(socket);
         crate::network::deterministic::sourced(self.source_ip(), self.network.dial(socket)).await
     }
 }
@@ -2695,50 +2811,25 @@ impl crate::Storage for Context {
         name: &[u8],
         versions: std::ops::RangeInclusive<BlobVersion>,
     ) -> Result<(Self::Blob, u64, BlobVersion), Error> {
-        // A crash before the namespace lock is taken interrupts the open (and any creation).
-        if self
-            .storage
-            .inner()
-            .inner()
-            .interrupt(partition, Some(name), StorageOp::Open)
-        {
-            return futures::future::pending().await;
-        }
-        let opened = self.opens.open(
-            partition,
-            name,
-            self.storage.open_versioned(partition, name, versions),
-        )?;
-        let retired = self.storage.inner().inner().admit(partition, name);
-        let opened = opened.finish();
-        drop(retired);
-        Ok(opened)
+        let partition = &*self.host_partition(partition)?;
+        self.open_partition(partition, name, versions)
+            .await
+            .map_err(|error| self.host_error(error))
     }
 
     async fn remove(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
-        let audited = self.storage.inner();
-        // A crash before the namespace lock is taken interrupts the removal.
-        if audited
-            .inner()
-            .interrupt(partition, name, StorageOp::Remove)
-        {
-            return futures::future::pending().await;
-        }
-        let retired = self.opens.remove(
-            partition,
-            name,
-            audited.remove_with(
-                partition,
-                name,
-                audited.inner().remove_retired(partition, name),
-            ),
-        )?;
-        drop(retired);
-        Ok(())
+        let partition = &*self.host_partition(partition)?;
+        self.remove_partition(partition, name)
+            .await
+            .map_err(|error| self.host_error(error))
     }
 
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
-        self.storage.scan(partition).await
+        let partition = &*self.host_partition(partition)?;
+        self.storage
+            .scan(partition)
+            .await
+            .map_err(|error| self.host_error(error))
     }
 }
 

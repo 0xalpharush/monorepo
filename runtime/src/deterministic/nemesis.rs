@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Weak},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -444,27 +444,16 @@ impl Swizzle {
     }
 }
 
-/// The source IP of each [Process] given one, by process.
-static SOURCES: Mutex<Vec<(Weak<ProcessState>, IpAddr)>> = Mutex::new(Vec::new());
-
 /// The source IP set for `process` or the nearest process it was started from.
 fn source_of(process: &Arc<ProcessState>) -> Option<IpAddr> {
-    let sources = SOURCES.lock();
     let mut current = Some(process);
     while let Some(process) = current {
-        if let Some((_, ip)) = sources
-            .iter()
-            .find(|(candidate, _)| ptr_eq(candidate, process))
-        {
-            return Some(*ip);
+        if let Some(ip) = *process.ip.lock() {
+            return Some(ip);
         }
         current = process.parent.as_ref();
     }
     None
-}
-
-fn ptr_eq(weak: &Weak<ProcessState>, process: &Arc<ProcessState>) -> bool {
-    std::ptr::eq(weak.as_ptr(), Arc::as_ptr(process))
 }
 
 impl Process {
@@ -478,16 +467,7 @@ impl Process {
         self.executor().auditor.event(b"process_ip", |hasher| {
             hasher.update(ip.to_string());
         });
-        let mut sources = SOURCES.lock();
-        sources.retain(|(process, _)| process.strong_count() > 0);
-        let state = &self.host.state;
-        match sources
-            .iter_mut()
-            .find(|(process, _)| ptr_eq(process, state))
-        {
-            Some((_, source)) => *source = ip,
-            None => sources.push((Arc::downgrade(state), ip)),
-        }
+        *self.host.state.ip.lock() = Some(ip);
     }
 }
 

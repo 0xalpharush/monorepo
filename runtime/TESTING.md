@@ -55,7 +55,7 @@ loop {
 
 ## Harness faults
 
-Run each simulated node in its own `context.process(label, owned_partitions)`. Group processes that fail together in a `deterministic::Zone` to crash, pause, or resume them at the same instant, and call `Process::wipe` (or `Zone::wipe`) to model total data loss before restarting a node. For network faults, install a `deterministic::Partitions` (with `Config::with_network_policy` for sockets, giving each process an IP with `Process::set_ip`, or `Oracle::set_policy` for `p2p::simulated`) and change it mid-run, or drive it with `deterministic::Swizzle`.
+Run each simulated node as a host: `context.host(name, HostConfig)` (or a `deterministic::Hosts` manager, which restarts hosts by name) gives it its own storage namespace (applications keep plain partition names), metrics registry, IP, clock, and storage latency, and crashing it affects exactly its storage. `context.process(label, owned_partitions)` starts a process that owns the partitions a selector picks, for finer-grained faults (such as one component of a host). Group processes that fail together in a `deterministic::Zone` to crash, pause, or resume them at the same instant, and call `Process::wipe` (or `Zone::wipe`) to model total data loss before restarting a node. For network faults, install a `deterministic::Partitions` (with `Config::with_network_policy` for sockets, giving each process an IP with `Process::set_ip`, or `Oracle::set_policy` for `p2p::simulated`) and change it mid-run, or drive it with `deterministic::Swizzle`.
 
 ## Verification checklist
 

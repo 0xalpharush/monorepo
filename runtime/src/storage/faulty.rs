@@ -367,6 +367,10 @@ pub(crate) trait Crasher: Send + Sync {
 
     /// Whether the disk of the process that owns `partition` is full.
     fn disk_full(&self, partition: &str) -> bool;
+
+    /// The latency range of the process that owns `partition`, if it overrides
+    /// [Config::latency].
+    fn latency(&self, partition: &str) -> Option<Range<Duration>>;
 }
 
 /// Filled once the owning runtime exists (storage is created before its executor) and emptied
@@ -569,7 +573,12 @@ impl Oracle {
     /// Reads config once to avoid nested lock acquisition.
     /// Wait out the latency of the operation `decision` describes, if latency is configured.
     async fn delay(&self, decision: &Decision<'_>) {
-        let Some(range) = self.config.read().latency.clone() else {
+        let owned = self
+            .crasher
+            .lock()
+            .clone()
+            .and_then(|crasher| crasher.latency(decision.partition));
+        let Some(range) = owned.or_else(|| self.config.read().latency.clone()) else {
             return;
         };
         let start = u64::try_from(range.start.as_nanos()).expect("bounded latency");
