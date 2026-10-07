@@ -239,3 +239,107 @@ fn test_host_campaign_sweep() {
         );
     }
 }
+
+/// A crash between journaling certificates and syncing the tip they advance can leave a
+/// validator's journal holding certificates for every height of its window above its last
+/// journaled tip. Replay restores the tip from the last `Tip` record and puts the certified
+/// heights in `confirmed`, but nothing advances the tip over them: the window is full (no new
+/// digest is requested) and no further certificate arrives for those heights. When a quorum of
+/// validators recovers into this state (as after a whole-cluster power loss), every validator
+/// that could advance them stays below, and the cluster stops certifying.
+///
+/// Builds that journal state directly (certificates for heights `0..window`, no `Tip` record)
+/// for every validator, then starts the engines and expects progress.
+#[test_traced("WARN")]
+#[ignore = "finding: replay does not advance the tip over journaled certificates"]
+fn test_replay_advances_tip_over_journaled_certificates() {
+    use crate::aggregation::types::{Ack, Activity, Certificate, Item};
+    use commonware_storage::journal::segmented::variable::{Config as JConfig, Journal};
+    use commonware_utils::iter::NonEmpty;
+
+    let window = 10u64;
+    deterministic::Runner::timed(Duration::from_secs(120)).start(|mut context| async move {
+        let fixture = ed25519::fixture(&mut context, TEST_NAMESPACE, 4);
+        let epoch = Epoch::new(111);
+        let certificates: Vec<_> = (0..window)
+            .map(|height| {
+                let item = Item {
+                    height: Height::new(height),
+                    digest: <commonware_cryptography::Sha256 as commonware_cryptography::Hasher>::hash(&[format!("data for height {height}").as_bytes()]),
+                };
+                let acks: Vec<_> = fixture
+                    .schemes
+                    .iter()
+                    .map(|scheme| Ack::sign(scheme, epoch, item.clone()).unwrap())
+                    .collect();
+                Certificate::from_acks(
+                    &fixture.schemes[0],
+                    NonEmpty::new(&acks[0], acks[1..].iter()),
+                    &Sequential,
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let names: Vec<String> = (0..4).map(|i| format!("v{i}")).collect();
+        let mut hosts = Hosts::new(&context);
+        for name in &names {
+            let host = hosts.start(name, HostConfig::new());
+            let mut journal = Journal::init(
+                host.child("journal"),
+                JConfig {
+                    partition: "aggregation".into(),
+                    compression: Some(3),
+                    codec_config: <ed25519::Scheme as commonware_cryptography::certificate::Verifier>::certificate_codec_config_unbounded(),
+                    page_cache: CacheRef::from_pooler(&host, PAGE_SIZE, PAGE_CACHE_SIZE),
+                    write_buffer: NZUsize!(4096),
+                },
+            )
+            .await
+            .unwrap();
+            for certificate in &certificates {
+                let section = certificate.item.height.get() / 6;
+                (journal, _, _) = journal
+                    .append(section, &Activity::<ed25519::Scheme, Sha256Digest>::Certified(certificate.clone()))
+                    .await
+                    .unwrap();
+            }
+            drop(journal.sync_all().await.unwrap());
+            hosts.crash(name);
+        }
+
+        let (oracle, mut registrations) =
+            initialize_simulation(context.child("simulation"), &fixture, RELIABLE_LINK).await;
+        let mut reporters = Vec::new();
+        for (idx, participant) in fixture.participants.iter().enumerate() {
+            let (reporter, mailbox) =
+                mocks::Reporter::new(context.child("reporter"), fixture.verifier.clone());
+            reporter.start();
+            reporters.push(mailbox.clone());
+            let host = hosts.restart(&names[idx]);
+            start_engine(
+                host,
+                &fixture,
+                idx,
+                epoch,
+                &oracle,
+                mailbox,
+                registrations.remove(participant).unwrap(),
+            );
+        }
+
+        let target = Height::new(window + 10);
+        let deadline = context.current() + Duration::from_secs(60);
+        loop {
+            let now = tips(&mut reporters).await;
+            if now.iter().all(|tip| *tip >= target) {
+                break;
+            }
+            assert!(
+                context.current() < deadline,
+                "no progress past the journaled certificates: tips {now:?}, target {target}"
+            );
+            context.sleep(Duration::from_millis(100)).await;
+        }
+    });
+}
