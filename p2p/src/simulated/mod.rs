@@ -3811,4 +3811,170 @@ mod tests {
             ));
         });
     }
+
+    /// Starts `size` fully linked peers whose messages `partitions` decides.
+    async fn start_partitioned_network(
+        context: &deterministic::Context,
+        size: usize,
+        partitions: std::sync::Arc<deterministic::Partitions<PublicKey>>,
+    ) -> (
+        Vec<PublicKey>,
+        Vec<network::Sender<PublicKey, deterministic::Context>>,
+        mpsc::UnboundedReceiver<Delivery>,
+    ) {
+        let (oracle, keys, senders, log) = start_logged_network(context, size).await;
+        for a in &keys {
+            for b in &keys {
+                if a != b {
+                    oracle.add_link(a.clone(), b.clone(), FAULT_LINK).await.unwrap();
+                }
+            }
+        }
+        oracle.set_policy(Some(partitions)).await.unwrap();
+        (keys, senders, log)
+    }
+
+    /// The (receiver, payload) of each delivery.
+    fn received(log: &mut mpsc::UnboundedReceiver<Delivery>) -> Vec<(usize, IoBuf)> {
+        drain(log)
+            .into_iter()
+            .map(|(to, _, message, _)| (to, message))
+            .collect()
+    }
+
+    #[test]
+    fn test_partitions_one_way_cut_partition_and_heal() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let partitions = std::sync::Arc::new(deterministic::Partitions::new(
+                deterministic::Jitter::new(0, Duration::from_millis(5), Duration::ZERO),
+            ));
+            let (keys, mut senders, mut log) =
+                start_partitioned_network(&context, 3, partitions.clone()).await;
+            let exchange = |senders: &mut Vec<network::Sender<_, _>>, pairs: &[(usize, usize)]| {
+                for (from, to) in pairs {
+                    senders[*from].send(
+                        Recipients::One(keys[*to].clone()),
+                        format!("{from}{to}").into_bytes(),
+                        false,
+                    );
+                }
+            };
+
+            // One way: 0 -> 1 is cut while 1 -> 0 still works
+            partitions.cut(&context, keys[0].clone(), keys[1].clone());
+            exchange(&mut senders, &[(0, 1), (1, 0)]);
+            context.sleep(Duration::from_secs(1)).await;
+            assert_eq!(received(&mut log), vec![(0, IoBuf::from(b"10"))]);
+
+            // Partition {0} | {1, 2}: only 1 <-> 2 works
+            partitions.heal(&context);
+            partitions.partition(&context, [vec![keys[0].clone()], keys[1..].to_vec()]);
+            exchange(&mut senders, &[(0, 2), (2, 0), (1, 2), (2, 1)]);
+            context.sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                received(&mut log),
+                vec![(2, IoBuf::from(b"12")), (1, IoBuf::from(b"21"))]
+            );
+
+            // Healing restores every link
+            partitions.heal(&context);
+            exchange(&mut senders, &[(0, 1), (0, 2)]);
+            context.sleep(Duration::from_secs(1)).await;
+            assert_eq!(received(&mut log).len(), 2);
+        });
+    }
+
+    #[test]
+    fn test_partitions_clog_releases_in_order() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            // Jitter would reorder messages if the clog did not hold them in order
+            let partitions = std::sync::Arc::new(deterministic::Partitions::new(
+                deterministic::Jitter::new(1, Duration::from_millis(5), Duration::from_millis(40)),
+            ));
+            let (keys, mut senders, mut log) =
+                start_partitioned_network(&context, 2, partitions.clone()).await;
+            let start = context.current();
+            partitions.clog(&context, keys[0].clone(), keys[1].clone(), Duration::from_secs(1));
+            for i in 0u8..5 {
+                senders[0].send(Recipients::One(keys[1].clone()), vec![i], false);
+                senders[1].send(Recipients::One(keys[0].clone()), vec![i], false);
+                context.sleep(Duration::from_millis(100)).await;
+            }
+            context.sleep(Duration::from_secs(2)).await;
+            let deliveries = drain(&mut log);
+            let clogged: Vec<_> = deliveries.iter().filter(|(to, ..)| *to == 1).collect();
+            let open: Vec<_> = deliveries.iter().filter(|(to, ..)| *to == 0).collect();
+            assert_eq!(clogged.len(), 5);
+            assert_eq!(open.len(), 5);
+            for (i, (_, _, message, at)) in clogged.iter().enumerate() {
+                assert_eq!(message.as_ref(), &[i as u8], "released in order");
+                assert!(at.duration_since(start).unwrap() >= Duration::from_secs(1));
+            }
+            for (_, _, _, at) in open {
+                assert!(at.duration_since(start).unwrap() < Duration::from_secs(1));
+            }
+        });
+    }
+
+    /// Streams numbered messages between every pair of peers while a swizzle clogs them,
+    /// returning the auditor state and every delivery.
+    fn swizzled(seed: u64) -> (String, Vec<Delivery>) {
+        let executor = deterministic::Runner::seeded(seed);
+        executor.start(|context| async move {
+            let partitions = std::sync::Arc::new(deterministic::Partitions::new(
+                deterministic::Jitter::new(seed, Duration::from_millis(5), Duration::from_millis(5)),
+            ));
+            let size = 4;
+            let (keys, senders, mut log) =
+                start_partitioned_network(&context, size, partitions.clone()).await;
+            for (from, mut sender) in senders.into_iter().enumerate() {
+                let keys = keys.clone();
+                context.child("sender").spawn(move |context| async move {
+                    for i in 0u32..50 {
+                        for (to, key) in keys.iter().enumerate() {
+                            if to != from {
+                                sender.send(
+                                    Recipients::One(key.clone()),
+                                    i.to_be_bytes().to_vec(),
+                                    false,
+                                );
+                            }
+                        }
+                        context.sleep(Duration::from_millis(50)).await;
+                    }
+                });
+            }
+            let steps = deterministic::Swizzle::new(seed)
+                .with_gap(Duration::from_millis(300))
+                .run(&context, &partitions, &keys)
+                .await;
+            assert!(!steps.is_empty());
+            context.sleep(Duration::from_secs(5)).await;
+            let deliveries = drain(&mut log);
+
+            // Clogs only delay: every message arrives, in order on each link
+            assert_eq!(deliveries.len(), size * (size - 1) * 50);
+            for to in 0..size {
+                for from in keys.iter().filter(|key| **key != keys[to]) {
+                    let sequence: Vec<u32> = deliveries
+                        .iter()
+                        .filter(|(receiver, origin, ..)| *receiver == to && origin == from)
+                        .map(|(_, _, message, _)| {
+                            u32::from_be_bytes(message.as_ref().try_into().unwrap())
+                        })
+                        .collect();
+                    assert_eq!(sequence, (0..50).collect::<Vec<_>>());
+                }
+            }
+            (context.auditor().state(), deliveries)
+        })
+    }
+
+    #[test]
+    fn test_swizzle_is_deterministic() {
+        assert_eq!(swizzled(5), swizzled(5));
+        assert_ne!(swizzled(5).0, swizzled(6).0);
+    }
 }

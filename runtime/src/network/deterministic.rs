@@ -1,13 +1,15 @@
 use crate::{Error, IoBufs, mocks};
 use commonware_utils::{channel::mpsc, sync::Mutex};
 use std::{
+    cell::Cell,
     collections::HashMap,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::Range,
     pin::Pin,
     sync::{Arc, OnceLock},
-    time::Duration,
+    task::{Context, Poll},
+    time::{Duration, SystemTime},
 };
 
 /// Range of ephemeral ports assigned to dialers.
@@ -34,6 +36,8 @@ pub struct Transmission<'a, A = SocketAddr> {
     pub index: u64,
     /// The transmission's length in bytes.
     pub len: usize,
+    /// The simulated time at which the transmission is sent.
+    pub at: SystemTime,
 }
 
 /// What a simulated network does with one transmission.
@@ -105,6 +109,14 @@ impl Delivery {
     }
 }
 
+/// A fixed [Delivery] is a policy that decides every transmission the same way (for example,
+/// [Delivery::NOW] for a perfect network).
+impl<A> Policy<A> for Delivery {
+    fn delivers(&self, _: &Transmission<'_, A>) -> Delivery {
+        *self
+    }
+}
+
 /// Decides the faults and latency of a simulated network.
 ///
 /// Without a policy, a network carries every transmission as configured. A policy sees every
@@ -128,6 +140,9 @@ pub trait Policy<A = SocketAddr>: Send + Sync {
 pub(crate) trait Timer: Send + Sync {
     /// Resolves once `delay` of simulated time has passed.
     fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    /// The current simulated time.
+    fn now(&self) -> SystemTime;
 }
 
 /// Filled once the owning runtime exists; the network is created before its executor.
@@ -158,16 +173,18 @@ impl Sink {
             timer,
         }
     }
+    fn timer(&self) -> Arc<dyn Timer> {
+        self.timer
+            .get()
+            .expect("a network with a policy needs its runtime's timer")
+            .clone()
+    }
+
     async fn sleep(&self, delay: Duration) {
         if delay.is_zero() {
             return;
         }
-        let timer = self
-            .timer
-            .get()
-            .expect("a network with latency needs its runtime's timer")
-            .clone();
-        timer.sleep(delay).await;
+        self.timer().sleep(delay).await;
     }
 }
 
@@ -189,8 +206,8 @@ fn flip(bufs: IoBufs, bit: u64) -> IoBufs {
 /// Carries out [Delivery] outcomes on a byte stream:
 ///
 /// - `after` delays the send, holding back the sends behind it, as on a TCP stream.
-/// - [Fate::Drop] and [Fate::Reset] reset the connection before the send: a stream cannot lose
-///   bytes without breaking, and the peer's stream fails too.
+/// - [Fate::Drop] and [Fate::Reset] reset the connection, after stalling the send for `after`: a
+///   stream cannot lose bytes without breaking, and the peer's stream fails too.
 /// - `corrupt` flips a bit of the sent bytes.
 /// - `duplicate` sends the bytes again (after the extra delay), as a retransmission bug would.
 impl crate::Sink for Sink {
@@ -208,9 +225,13 @@ impl crate::Sink for Sink {
                 channel: None,
                 index,
                 len: bytes::Buf::remaining(&bufs),
+                at: self.timer().now(),
             });
             if delivery.fate != Fate::Deliver {
-                // Dropping the sink closes the pipe, so the peer's stream fails too.
+                // The send stalls for `after` (as a TCP retransmission timeout would) before the
+                // connection breaks. Dropping the sink closes the pipe, so the peer's stream fails
+                // too.
+                self.sleep(delivery.after).await;
                 self.inner = None;
                 return Err(Error::Closed);
             }
@@ -264,7 +285,40 @@ type Dialable = mpsc::UnboundedSender<(
     mocks::Stream, // Dialer -> Listener
 )>;
 
+std::thread_local! {
+    /// The source IP of the dial being polled on this thread, if its dialer has one.
+    static DIAL_SOURCE: Cell<Option<IpAddr>> = const { Cell::new(None) };
+}
+
+/// Polls `dial` with `source` as the IP its dialer's ephemeral address takes.
+pub(crate) fn sourced<F: Future>(source: Option<IpAddr>, dial: F) -> Sourced<F> {
+    Sourced {
+        source,
+        dial: Box::pin(dial),
+    }
+}
+
+/// A dial polled with its dialer's source IP; see [sourced].
+pub(crate) struct Sourced<F> {
+    source: Option<IpAddr>,
+    dial: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for Sourced<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let previous = DIAL_SOURCE.replace(self.source);
+        let result = self.dial.as_mut().poll(cx);
+        DIAL_SOURCE.set(previous);
+        result
+    }
+}
+
 /// Deterministic implementation of [crate::Network].
+///
+/// A dialer is given an ephemeral port on its source IP: the IP set for its process (see
+/// [crate::deterministic::Process::set_ip]), or `127.0.0.1` without one.
 ///
 /// When a dialer connects to a listener, the listener is given a new ephemeral port
 /// from the range `32768..61000`. To keep things simple, it is not possible to
@@ -332,10 +386,13 @@ impl crate::Network for Network {
     }
 
     async fn dial(&self, socket: SocketAddr) -> Result<(Sink, Stream), Error> {
-        // Assign dialer a port from the ephemeral range
+        // Assign dialer a port from the ephemeral range on its source IP
+        let source = DIAL_SOURCE
+            .get()
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let dialer = {
             let mut ephemeral = self.ephemeral.lock();
-            let dialer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), *ephemeral);
+            let dialer = SocketAddr::new(source, *ephemeral);
             *ephemeral = ephemeral
                 .checked_add(1)
                 .expect("ephemeral port range exhausted");
