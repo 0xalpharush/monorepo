@@ -2091,22 +2091,32 @@ impl ProcessState {
         parent + self.clock.lock().drift
     }
 
-    /// The earliest runtime time (nanoseconds since the epoch) at which this process's clock
-    /// reads at least `deadline`.
-    fn runtime_time(&self, deadline: i128) -> i128 {
+    /// The earliest runtime time at which this process's clock reads at least `deadline`, or
+    /// `None` if that time is too far away to represent (it is then never reached in practice).
+    fn runtime_deadline(&self, deadline: SystemTime) -> Option<SystemTime> {
+        let deadline = nanos_since_epoch(deadline);
+        if deadline > i128::from(i64::MAX) {
+            return None;
+        }
+
         // The offset is linear in runtime time up to rounding: estimate, then correct.
-        let drift = self.drift();
-        let base = self.offset(0);
         let estimate = deadline
-            .checked_sub(base)
-            .and_then(|value| value.checked_mul(i128::from(PPM)))
-            .expect("clock overflow")
-            / (i128::from(PPM) + drift);
+            .checked_sub(self.offset(0))?
+            .checked_mul(i128::from(PPM))?
+            / (i128::from(PPM) + self.drift());
+        if estimate > i128::from(i64::MAX) {
+            return None;
+        }
         let mut time = estimate.saturating_sub(2);
         while time + self.offset(time) < deadline {
             time += 1;
         }
-        time
+        let magnitude = Duration::from_nanos(u64::try_from(time.unsigned_abs()).ok()?);
+        if time >= 0 {
+            UNIX_EPOCH.checked_add(magnitude)
+        } else {
+            UNIX_EPOCH.checked_sub(magnitude)
+        }
     }
 }
 
@@ -2299,9 +2309,11 @@ impl Clock for Context {
         Sleeper {
             executor: self.executor.clone(),
 
-            time: self.process.as_ref().map_or(deadline, |process| {
-                from_nanos_since_epoch(process.runtime_time(nanos_since_epoch(deadline)))
-            }),
+            time: self
+                .process
+                .as_ref()
+                .and_then(|process| process.runtime_deadline(deadline))
+                .unwrap_or(deadline),
             waker: None,
         }
     }
@@ -4963,6 +4975,21 @@ mod tests {
                 ctx.logical_blob("node", b"blob").as_deref(),
                 Some(&b"DATAmore"[..])
             );
+        });
+    }
+
+    #[test]
+    fn test_process_sleep_until_far_future_does_not_overflow() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let (node, process) = ctx.process("node", |_| false);
+            process.set_clock_drift(-500_000);
+            process.set_clock_offset(ClockOffset::Ahead(Duration::from_secs(1)));
+            let never = node.current().saturating_add_ext(Duration::MAX);
+            let sleeper = node.child("sleeper").spawn(move |ctx| async move {
+                ctx.sleep_until(never).await;
+            });
+            ctx.sleep(Duration::from_secs(1)).await;
+            sleeper.abort();
         });
     }
 
