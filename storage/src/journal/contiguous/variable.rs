@@ -10247,8 +10247,8 @@ mod tests {
     struct NamespaceCrash {
         crash_at: usize,
         retain: fn(usize) -> bool,
-        crashes: std::sync::Mutex<usize>,
-        retentions: std::sync::Mutex<usize>,
+        crashes: commonware_utils::sync::Mutex<usize>,
+        retentions: commonware_utils::sync::Mutex<usize>,
     }
 
     impl deterministic::FaultPolicy for NamespaceCrash {
@@ -10259,13 +10259,13 @@ mod tests {
         ) -> bool {
             match decision.draw {
                 deterministic::FaultDraw::Crash => {
-                    let mut crashes = self.crashes.lock().unwrap();
+                    let mut crashes = self.crashes.lock();
                     let crash = *crashes == self.crash_at;
                     *crashes += 1;
                     crash
                 }
                 deterministic::FaultDraw::RetainCreate | deterministic::FaultDraw::RetainRemove => {
-                    let mut retentions = self.retentions.lock().unwrap();
+                    let mut retentions = self.retentions.lock();
                     *retentions += 1;
                     (self.retain)(*retentions - 1)
                 }
@@ -10319,7 +10319,7 @@ mod tests {
                     .with_storage_fault_policy(policy);
                 let completed = deterministic::Runner::new(cfg).start(|context| async move {
                     let cfg = initialization_cfg(&context, "ns-crash", 3);
-                    let acked = Arc::new(std::sync::Mutex::new(Acked::default()));
+                    let acked = Arc::new(commonware_utils::sync::Mutex::new(Acked::default()));
                     let (node, process) =
                         context.process("node", |partition| partition.starts_with("ns-crash"));
                     let progress = acked.clone();
@@ -10328,7 +10328,7 @@ mod tests {
                         .child("workload")
                         .spawn(move |context| async move {
                             let cfg = workload_cfg;
-                            let ack = |end| progress.lock().unwrap().end = end;
+                            let ack = |end| progress.lock().end = end;
                             let mut journal =
                                 Journal::<_, u64>::init(context.child("first"), cfg.clone())
                                     .await
@@ -10343,7 +10343,7 @@ mod tests {
                                 (journal, _) = journal.prune(round * 3).await.unwrap();
                             }
                             drop(journal);
-                            progress.lock().unwrap().reset_started = true;
+                            progress.lock().reset_started = true;
                             let mut journal = Journal::<_, u64>::init_at_size(
                                 context.child("reset"),
                                 cfg.clone(),
@@ -10352,7 +10352,7 @@ mod tests {
                             .await
                             .unwrap();
                             {
-                                let mut progress = progress.lock().unwrap();
+                                let mut progress = progress.lock();
                                 progress.reset_done = true;
                                 progress.end = RESET;
                             }
@@ -10369,7 +10369,7 @@ mod tests {
                     // Release the partitions so recovery cannot be interrupted.
                     process.crash();
                     // Recover and check the acknowledged prefix.
-                    let acked = *acked.lock().unwrap();
+                    let acked = *acked.lock();
                     let cfg = initialization_cfg(&context, "ns-crash", 3);
                     let journal = Journal::<_, u64>::init(context.child("recovered"), cfg)
                         .await

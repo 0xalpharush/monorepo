@@ -1922,7 +1922,9 @@ mod tests {
                 }
                 PendingMutation::Sync { .. } => {}
                 PendingMutation::Resize { .. } => panic!("write test recorded a resize"),
-                PendingMutation::Namespace { .. } => panic!("write test recorded a namespace change"),
+                PendingMutation::Namespace { .. } => {
+                    panic!("write test recorded a namespace change")
+                }
             }
         }
         let (durable, len) = h.inner.open("partition", b"overlap").await.unwrap();
