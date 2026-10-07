@@ -111,6 +111,29 @@ pub struct ResizeConfig {
     pub partial_rate: Probability,
 }
 
+/// Fault configuration for namespace changes: creating a blob (an [crate::Storage::open] of a
+/// missing blob) and removing a blob or partition.
+///
+/// A successful open durably creates its blob and a successful remove durably removes its
+/// target, so a completed namespace change never reverts. The only window in which a crash can
+/// lose or keep one is during the call, before it returns (as a crash between a file's creation
+/// or unlink and the directory sync that makes it durable). This configuration crashes the
+/// process that owns the partition from within such a call and lets the crash decide whether the
+/// change survives.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MetadataConfig {
+    /// Probability that an open or remove of a partition owned by a live simulated process
+    /// crashes that process during the operation, before its namespace change is durable. The
+    /// operation never completes.
+    pub crash_rate: Probability,
+
+    /// Probability that an interrupted namespace change survives the crash. An interrupted
+    /// creation leaves either no blob or an empty blob (its header was never durable, so a later
+    /// open initializes it). An interrupted partition removal decides each of the partition's
+    /// blobs independently and, once every blob is removed, the partition itself.
+    pub retention_rate: Probability,
+}
+
 /// Configuration for deterministic storage fault injection.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
@@ -154,6 +177,9 @@ pub struct Config {
     /// Probability that a successful `read_at` returns the same number of bytes from a different
     /// offset of the same blob, as a misdirected read would. Durable contents are unchanged.
     pub misdirect_read_rate: Option<Probability>,
+
+    /// Crash and retention configuration for interrupted namespace changes.
+    pub metadata: Option<MetadataConfig>,
 }
 
 impl Config {
@@ -236,6 +262,12 @@ impl Config {
         self.misdirect_read_rate = Some(rate);
         self
     }
+
+    /// Set the crash and retention configuration for interrupted namespace changes.
+    pub const fn metadata(mut self, config: MetadataConfig) -> Self {
+        self.metadata = Some(config);
+        self
+    }
 }
 
 /// What one storage fault decision determines.
@@ -258,7 +290,7 @@ pub enum Draw {
     Corrupt,
     /// The index of the bit flipped in a corrupted read (bit `i` is bit `i % 8` of byte `i / 8`).
     CorruptBit,
-    /// Whether a write or sync crashes the process that owns its partition.
+    /// Whether a write, sync, open, or remove crashes the process that owns its partition.
     Crash,
     /// An operation's latency in nanoseconds.
     Latency,
@@ -266,6 +298,11 @@ pub enum Draw {
     MisdirectRead,
     /// The offset a misdirected read returns data from.
     MisdirectOffset,
+    /// Whether a crash keeps the blob an interrupted open was creating.
+    RetainCreate,
+    /// Whether a crash keeps the removal of a blob (or, with no name, of the emptied partition)
+    /// that an interrupted remove was performing.
+    RetainRemove,
 }
 
 /// One storage fault decision: the file and operation it concerns, and what it determines.
@@ -356,6 +393,20 @@ enum PendingMutation<B> {
     },
     /// A full-sync cut whose completion determines whether earlier mutations remain pending.
     Sync { sync: Arc<PendingSync> },
+    /// A namespace change interrupted by a crash before it became durable.
+    Namespace {
+        partition: String,
+        change: NamespaceChange,
+        retention_rate: Probability,
+    },
+}
+
+/// A namespace change whose durability a crash decides.
+enum NamespaceChange {
+    /// Creation of the named blob.
+    Create(Vec<u8>),
+    /// Removal of the named blob, or of the entire partition.
+    Remove(Option<Vec<u8>>),
 }
 
 /// One initiated full sync owns its durability cut and is observed by both its caller and crash
@@ -390,10 +441,32 @@ impl PendingWriteRetention {
 }
 
 impl<B> PendingMutation<B> {
-    fn generation(&self) -> &Arc<FileGeneration> {
+    /// The file generation the entry belongs to, or `None` for a namespace change.
+    fn generation(&self) -> Option<&Arc<FileGeneration>> {
         match self {
-            Self::Write { generation, .. } | Self::Resize { generation, .. } => generation,
-            Self::Sync { sync } => &sync.generation,
+            Self::Write { generation, .. } | Self::Resize { generation, .. } => Some(generation),
+            Self::Sync { sync } => Some(&sync.generation),
+            Self::Namespace { .. } => None,
+        }
+    }
+
+    /// Whether the entry belongs to `generation`.
+    fn belongs_to(&self, generation: &Arc<FileGeneration>) -> bool {
+        self.generation()
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, generation))
+    }
+
+    /// The partition the entry concerns.
+    fn partition(&self) -> &str {
+        match self {
+            Self::Namespace { partition, .. } => partition,
+            mutation => {
+                &mutation
+                    .generation()
+                    .expect("file entries have a generation")
+                    .file
+                    .0
+            }
         }
     }
 }
@@ -453,7 +526,7 @@ fn clear_pending<B>(
         .extract_if(.., |mutation| {
             generations
                 .iter()
-                .any(|generation| Arc::ptr_eq(mutation.generation(), generation))
+                .any(|generation| mutation.belongs_to(generation))
         })
         .collect();
     Retired {
@@ -477,9 +550,7 @@ fn resolve_pending_sync<B>(
     let retired: Vec<_> = pending.extract_if(.., |mutation| {
         let is_target = matches!(mutation, PendingMutation::Sync { sync: candidate, .. } if Arc::ptr_eq(candidate, sync));
         let retire = is_target
-            || (succeeded
-                && index < cut
-                && Arc::ptr_eq(mutation.generation(), &sync.generation));
+            || (succeeded && index < cut && mutation.belongs_to(&sync.generation));
         index += 1;
         retire
     }).collect();
@@ -811,6 +882,53 @@ impl<S: crate::Storage> Storage<S> {
         clear_pending(&self.pending, &retired)
     }
 
+    /// Decide whether an `op` ([Op::Open] or [Op::Remove]) of `name` (or, for a removal with
+    /// no name, of the whole partition) crashes the live process that owns `partition` before
+    /// its namespace change is durable. Draws only when [Config::metadata] enables such crashes
+    /// and a live process owns the partition.
+    ///
+    /// When it does, the interrupted change is journaled, the owner crashes (resolving the
+    /// journal), and this returns true: the caller must then never complete the operation. The
+    /// caller must hold no namespace lock, since crashing drops the owner's handles.
+    pub(crate) fn interrupt(&self, partition: &str, name: Option<&[u8]>, op: Op) -> bool {
+        let Some(config) = self
+            .ctx
+            .config
+            .read()
+            .metadata
+            .filter(|config| !config.crash_rate.is_zero())
+        else {
+            return false;
+        };
+        if super::validate_partition_name(partition).is_err() {
+            return false;
+        }
+        let Some(crasher) = self.ctx.crasher.lock().clone() else {
+            return false;
+        };
+        let decision = Decision {
+            partition,
+            name,
+            op,
+            draw: Draw::Crash,
+        };
+        if !crasher.owns(partition) || !self.ctx.roll(&decision, config.crash_rate) {
+            return false;
+        }
+        let change = match op {
+            Op::Open => NamespaceChange::Create(name.expect("an open names its blob").to_vec()),
+            Op::Remove => NamespaceChange::Remove(name.map(<[u8]>::to_vec)),
+            op => unreachable!("{op:?} does not change the namespace"),
+        };
+        self.pending.lock().push(PendingMutation::Namespace {
+            partition: partition.to_owned(),
+            change,
+            retention_rate: config.retention_rate,
+        });
+        crasher.crash(partition);
+        true
+    }
+
     /// Retire the removed file's crash evidence without destroying its byte owners.
     pub(crate) async fn remove_retired(
         &self,
@@ -847,6 +965,73 @@ impl Storage<crate::storage::memory::Storage> {
         clear_pending(&self.pending, std::slice::from_ref(&generation))
     }
 
+    /// Apply the durable outcome of a namespace change that a crash interrupted.
+    ///
+    /// Draws only for changes that would alter durable contents: creating a missing blob or
+    /// removing an existing one.
+    fn resolve_namespace(
+        &self,
+        partition: &str,
+        change: NamespaceChange,
+        rate: Probability,
+    ) -> Result<(), Error> {
+        let retain = |name: Option<&[u8]>, op, draw| {
+            self.ctx.roll(
+                &Decision {
+                    partition,
+                    name,
+                    op,
+                    draw,
+                },
+                rate,
+            )
+        };
+        match change {
+            NamespaceChange::Create(name) => {
+                if self.inner.raw_blob(partition, &name).is_none()
+                    && retain(Some(&name), Op::Open, Draw::RetainCreate)
+                {
+                    // The name became durable before any of its header did.
+                    self.inner.set_raw_blob(partition, &name, Vec::new());
+                }
+            }
+            NamespaceChange::Remove(Some(name)) => {
+                if self.inner.raw_blob(partition, &name).is_some()
+                    && retain(Some(&name), Op::Remove, Draw::RetainRemove)
+                {
+                    self.remove_durable(partition, Some(&name))?;
+                }
+            }
+            NamespaceChange::Remove(None) => {
+                let names = match crate::Storage::scan(&self.inner, partition).now_or_never() {
+                    Some(Ok(names)) => names,
+                    Some(Err(Error::PartitionMissing(_))) => return Ok(()),
+                    Some(Err(error)) => return Err(error),
+                    None => unreachable!("memory scans complete in one poll"),
+                };
+                let mut emptied = true;
+                for name in names {
+                    if retain(Some(&name), Op::Remove, Draw::RetainRemove) {
+                        self.remove_durable(partition, Some(&name))?;
+                    } else {
+                        emptied = false;
+                    }
+                }
+                if emptied && retain(None, Op::Remove, Draw::RetainRemove) {
+                    self.remove_durable(partition, None)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a blob or partition from durable contents.
+    fn remove_durable(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
+        crate::Storage::remove(&self.inner, partition, name)
+            .now_or_never()
+            .expect("memory removals complete in one poll")
+    }
+
     /// Replay selected crash outcomes in issue order.
     pub(crate) fn crash(&self) -> Result<(), Error> {
         self.crash_partitions(|_| true)
@@ -861,7 +1046,7 @@ impl Storage<crate::storage::memory::Storage> {
         let pending: Vec<_> = self
             .pending
             .lock()
-            .extract_if(.., |mutation| affected(&mutation.generation().file.0))
+            .extract_if(.., |mutation| affected(mutation.partition()))
             .collect();
         let mut synced = HashSet::new();
         let mut replay = Vec::with_capacity(pending.len());
@@ -873,7 +1058,10 @@ impl Storage<crate::storage::memory::Storage> {
                     }
                 }
                 mutation => {
-                    if !synced.contains(&Arc::as_ptr(mutation.generation())) {
+                    if mutation
+                        .generation()
+                        .is_none_or(|generation| !synced.contains(&Arc::as_ptr(generation)))
+                    {
                         replay.push(mutation);
                     }
                 }
@@ -906,6 +1094,11 @@ impl Storage<crate::storage::memory::Storage> {
                 PendingMutation::Resize { blob, len, .. } => {
                     blob.retain_crash_resize(len)?;
                 }
+                PendingMutation::Namespace {
+                    partition,
+                    change,
+                    retention_rate,
+                } => self.resolve_namespace(&partition, change, retention_rate)?,
                 PendingMutation::Sync { .. } => unreachable!("sync markers are not replayed"),
             }
         }
@@ -1051,7 +1244,7 @@ impl<B: crate::Blob> Blob<B> {
         let mut retired = Vec::new();
         let mut follows_resize = false;
         for mutation in mutations {
-            if !Arc::ptr_eq(mutation.generation(), &self.generation) {
+            if !mutation.belongs_to(&self.generation) {
                 retained.push(mutation);
                 continue;
             }
@@ -1073,6 +1266,9 @@ impl<B: crate::Blob> Blob<B> {
                     sync @ PendingMutation::Sync { .. } => {
                         retained.push(sync);
                         continue;
+                    }
+                    PendingMutation::Namespace { .. } => {
+                        unreachable!("namespace changes belong to no generation")
                     }
                 };
             let write_len = bufs.remaining() as u64;
@@ -1726,6 +1922,7 @@ mod tests {
                 }
                 PendingMutation::Sync { .. } => {}
                 PendingMutation::Resize { .. } => panic!("write test recorded a resize"),
+                PendingMutation::Namespace { .. } => panic!("write test recorded a namespace change"),
             }
         }
         let (durable, len) = h.inner.open("partition", b"overlap").await.unwrap();
@@ -2228,7 +2425,9 @@ mod tests {
             .iter()
             .find_map(|mutation| match mutation {
                 PendingMutation::Resize { len, .. } => Some(*len),
-                PendingMutation::Write { .. } | PendingMutation::Sync { .. } => None,
+                PendingMutation::Write { .. }
+                | PendingMutation::Sync { .. }
+                | PendingMutation::Namespace { .. } => None,
             })
             .unwrap();
         h.storage.crash().unwrap();
