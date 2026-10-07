@@ -146,6 +146,7 @@ mod bandwidth;
 mod ingress;
 mod metrics;
 mod network;
+pub mod sockets;
 mod transmitter;
 
 use thiserror::Error;
