@@ -495,11 +495,17 @@ impl MetricHandle {
 /// A panic emitted by a spawned task.
 pub type Panic = Box<dyn Any + Send + 'static>;
 
+/// Decides from a panic's message whether to contain it (see [`Panicker::containing`]).
+pub(crate) type Containment = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// Notifies the runtime when a spawned task panics, so it can propagate the failure.
 #[derive(Clone)]
 pub(crate) struct Panicker {
     catch: bool,
     sender: Arc<Mutex<Option<oneshot::Sender<Panic>>>>,
+    /// Consulted with each panic's message before the panic is handled; returning `true`
+    /// contains the panic, so it is neither caught nor propagated.
+    contain: Option<Containment>,
 }
 
 impl Panicker {
@@ -509,6 +515,7 @@ impl Panicker {
         let panicker = Self {
             catch,
             sender: Arc::new(Mutex::new(Some(sender))),
+            contain: None,
         };
         let panicked = Panicked { receiver };
         (panicker, panicked)
@@ -520,11 +527,27 @@ impl Panicker {
         self.catch
     }
 
+    /// Returns a [Panicker] that first offers each panic's message to `contain`, which contains
+    /// the panic by returning `true`.
+    #[commonware_macros::stability(ALPHA)]
+    pub(crate) fn containing(&self, contain: Containment) -> Self {
+        Self {
+            catch: self.catch,
+            sender: self.sender.clone(),
+            contain: Some(contain),
+        }
+    }
+
     /// Notifies the [Panicker] that a panic has occurred.
     pub(crate) fn notify(&self, panic: Box<dyn Any + Send + 'static>) {
         // Log the panic
         let err = extract_panic_message(&*panic);
         error!(?err, "task panicked");
+
+        // A containing panicker may absorb the panic
+        if self.contain.as_ref().is_some_and(|contain| contain(&err)) {
+            return;
+        }
 
         // If we are catching panics, just return
         if self.catch {
