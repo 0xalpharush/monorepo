@@ -2331,6 +2331,75 @@ mod tests {
         });
     }
 
+    /// A bounded open whose cap ends inside a valid partial page that has later pages after it
+    /// (a hole above the cap) must still serve the capped items.
+    ///
+    /// Models a crash after an unsynced append rewrote the durable partial page 1 and wrote
+    /// later pages: writeback persisted the later pages but not the rewrite of page 1 (pages of
+    /// an unsynced write may persist in any order), so page 1 still holds its durable partial
+    /// contents. The checkpoint covers only the items synced before the append. Unbounded
+    /// recovery truncates at the hole; bounded recovery to the acknowledged size used to accept
+    /// the blob untrimmed (the capped prefix is recoverable), after which reads of page 1
+    /// rejected it as a partial interior page with `InvalidChecksum`.
+    #[test]
+    #[ignore = "finding: bounded recovery keeps a partial interior page above its cap"]
+    fn test_bounded_recovery_trims_hole_above_cap() {
+        for bounded in [false, true] {
+            deterministic::Runner::default().start(|context| async move {
+                let cfg = test_cfg(&context, NZU64!(20));
+                let mut journal = Journal::<_, u64>::init(context.child("seed"), cfg.clone())
+                    .await
+                    .unwrap();
+                for value in 0..7u64 {
+                    (journal, _) = journal.append(&value).await.unwrap();
+                }
+                drop(journal.sync().await.unwrap());
+
+                // Snapshot the durable partial page 1, append behind the journal's back (so its
+                // checkpoint keeps acknowledging 7 items), then restore page 1 as if its rewrite
+                // never reached the disk while the later pages did.
+                let partition = blob_partition(&cfg);
+                let name = 0u64.to_be_bytes();
+                let physical_page = u64::from(PAGE_SIZE.get()) + 12;
+                let (blob, size) = context.open(&partition, &name).await.unwrap();
+                let durable_page = blob
+                    .read_at(physical_page, physical_page as usize, ReadOptions::default())
+                    .await
+                    .unwrap()
+                    .coalesce();
+                let cache = CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE);
+                let mut writer = Writer::new(blob, size, 2048, cache).await.unwrap();
+                for value in 7..20u64 {
+                    (writer, _) = writer.append(&value.to_be_bytes()).await.unwrap();
+                }
+                drop(writer.sync().await.unwrap());
+                let (blob, _) = context.open(&partition, &name).await.unwrap();
+                blob.write_at(physical_page, durable_page.as_ref().to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+                blob.sync().await.unwrap();
+                drop(blob);
+
+                use authenticated::{Backing as _, BackingRecovery as _};
+                let recovery = Journal::<_, u64>::recover(
+                    context.child("reopen"),
+                    cfg,
+                    bounded.then_some(7),
+                )
+                .await
+                .unwrap();
+                assert_eq!(recovery.bounds(), 0..7);
+                for position in 0..7 {
+                    let item = recovery
+                        .read(position)
+                        .await
+                        .unwrap_or_else(|err| panic!("bounded={bounded} read {position}: {err:?}"));
+                    assert_eq!(item, position);
+                }
+            });
+        }
+    }
+
     #[test]
     fn test_fixed_bounded_recovery_read_count() {
         for count in [257u64, 4097] {
