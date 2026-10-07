@@ -259,12 +259,9 @@ impl<
         // A crash can journal certificates without the tip they advance (the tip is synced in
         // its own section), so advance over contiguous certified heights as a live certificate
         // would.
-        let mut new_tip = self.tip;
-        while self.confirmed.contains_key(&new_tip) && new_tip.get() < u64::MAX {
-            new_tip = new_tip.next();
-        }
-        if new_tip > self.tip {
-            self = self.fast_forward_tip(new_tip).await;
+        if self.confirmed.contains_key(&self.tip) && self.tip.get() < u64::MAX {
+            let next = self.tip.next();
+            self = self.fast_forward_tip(next).await;
         }
 
         // Request digests for unverified heights
@@ -822,8 +819,13 @@ impl<
     /// # Panics
     ///
     /// Panics if the given tip is less-than-or-equal-to the current tip.
-    async fn fast_forward_tip(mut self, tip: Height) -> Self {
+    async fn fast_forward_tip(mut self, mut tip: Height) -> Self {
         assert!(tip > self.tip);
+
+        // Skip heights already certified: no further certificate arrives to advance past them.
+        while self.confirmed.contains_key(&tip) && tip.get() < u64::MAX {
+            tip = tip.next();
+        }
 
         // Prune data structures with buffer to prevent losing certificates
         let activity_threshold = tip.saturating_sub(self.activity_timeout);
