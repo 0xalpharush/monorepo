@@ -18,7 +18,7 @@ use commonware_cryptography::PublicKey;
 use commonware_macros::{select, select_loop};
 use commonware_runtime::{
     BufferPooler, Clock, ContextCell, Handle, Metrics, Network, Resolver, SinkOf, Spawner,
-    StreamOf, spawn_cell,
+    StreamOf, buggify, spawn_cell,
     telemetry::metrics::{CounterFamily, MetricsExt as _},
 };
 use commonware_stream::Upgrader;
@@ -121,6 +121,12 @@ where
             let allow_private_ips = self.allow_private_ips;
             let dial_timeout = self.dial_timeout;
             move |mut context| async move {
+                // Any dial may time out before it completes.
+                let dial_timeout = if buggify!(context) {
+                    Duration::ZERO
+                } else {
+                    dial_timeout
+                };
                 let timeout = context.sleep(dial_timeout);
                 let dial = async {
                     // Resolve ingress to socket addresses (filtered by private IP policy)

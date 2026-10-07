@@ -87,7 +87,7 @@ use commonware_formatting::hex;
 use commonware_macros::select;
 use commonware_parallel::{Rayon, ThreadPool};
 use commonware_utils::{
-    Cached, SystemTimeExt,
+    Cached, Probability, SystemTimeExt,
     sync::{Mutex, RwLock},
     time::SYSTEM_TIME_PRECISION,
 };
@@ -260,6 +260,9 @@ impl BlobSnapshot {
     }
 }
 
+mod buggify;
+use buggify::Buggify;
+pub use buggify::{BuggifyPolicy, Seeded as SeededBuggify};
 mod nemesis;
 pub use nemesis::{Jitter, Partitions, Swizzle, SwizzleStep};
 mod scheduling;
@@ -357,6 +360,9 @@ pub struct Config {
     /// Decides connection faults and latency. Defaults to lossless, zero-latency connections.
     network_policy: Option<Arc<dyn NetworkPolicy>>,
 
+    /// Decides [crate::buggify!] sites. Defaults to no site ever firing.
+    buggify_policy: Option<Arc<dyn BuggifyPolicy>>,
+
     /// Buffer pool configuration for network I/O.
     network_buffer_pool_cfg: BufferPoolConfig,
 
@@ -394,6 +400,7 @@ impl Config {
             storage_fault_cfg: FaultConfig::default(),
             storage_fault_policy: None,
             network_policy: None,
+            buggify_policy: None,
             network_buffer_pool_cfg,
             storage_buffer_pool_cfg,
         }
@@ -484,6 +491,25 @@ impl Config {
         self
     }
 
+    /// Enable [crate::buggify!] sites with a [SeededBuggify] policy.
+    ///
+    /// Each site is enabled for the whole run with probability `enable_rate` and an enabled site
+    /// fires with probability `fire_rate` on each evaluation (unless the site requests its own
+    /// rate). Decisions derive from `seed` and the site alone, so they do not perturb any other
+    /// randomness in the runtime. FoundationDB uses 25% for both rates.
+    pub fn with_buggify(self, seed: u64, enable_rate: Probability, fire_rate: Probability) -> Self {
+        self.with_buggify_policy(Arc::new(SeededBuggify::new(seed, enable_rate, fire_rate)))
+    }
+
+    /// Decide every [crate::buggify!] site with `policy`.
+    ///
+    /// Without a policy, no site fires. The policy survives [Runner::start_and_recover], as does
+    /// each site's enablement.
+    pub fn with_buggify_policy(mut self, policy: Arc<dyn BuggifyPolicy>) -> Self {
+        self.buggify_policy = Some(policy);
+        self
+    }
+
     // Getters
     /// See [Config]
     pub const fn cycle(&self) -> Duration {
@@ -543,6 +569,7 @@ pub struct Executor {
     rng: Arc<Mutex<BoxDynRng>>,
     scheduling_policy: Option<Arc<Mutex<BoxDynSchedulingPolicy>>>,
     network_policy: Option<Arc<dyn NetworkPolicy>>,
+    buggify: Option<Arc<Buggify>>,
     time: Mutex<SystemTime>,
     tasks: Arc<Tasks>,
     sleeping: Mutex<BinaryHeap<Alarm>>,
@@ -781,6 +808,7 @@ pub struct Checkpoint {
     storage_fault_cfg: FaultConfig,
     storage_fault_policy: Arc<dyn FaultPolicy>,
     network_policy: Option<Arc<dyn NetworkPolicy>>,
+    buggify: Option<Arc<Buggify>>,
     dns: Mutex<HashMap<String, Vec<IpAddr>>>,
     catch_panics: bool,
     network_buffer_pool_cfg: BufferPoolConfig,
@@ -1034,6 +1062,7 @@ impl Runner {
             rng: executor.rng,
             scheduling_policy: executor.scheduling_policy,
             network_policy: executor.network_policy,
+            buggify: executor.buggify,
             time: executor.time,
             storage,
             storage_fault_cfg,
@@ -1315,6 +1344,9 @@ impl Context {
                 .scheduling_policy
                 .map(|policy| Arc::new(Mutex::new(policy))),
             network_policy: cfg.network_policy,
+            buggify: cfg
+                .buggify_policy
+                .map(|policy| Arc::new(Buggify::new(policy))),
             time: Mutex::new(start_time),
             tasks: Arc::new(Tasks::new()),
             sleeping: Mutex::new(BinaryHeap::new()),
@@ -1403,6 +1435,7 @@ impl Context {
             rng: checkpoint.rng,
             scheduling_policy: checkpoint.scheduling_policy,
             network_policy: checkpoint.network_policy,
+            buggify: checkpoint.buggify,
             time: checkpoint.time,
             dns: checkpoint.dns,
 
@@ -2126,6 +2159,16 @@ impl crate::Supervisor for Context {
             label: self.name.clone(),
             attributes: self.attributes.clone(),
         }
+    }
+
+    fn buggify(&self, site: &crate::Site, rate: Option<Probability>) -> bool {
+        // A site evaluated after the runtime has shut down (e.g. while dropping) never fires.
+        self.executor.upgrade().is_some_and(|executor| {
+            executor
+                .buggify
+                .as_ref()
+                .is_some_and(|buggify| buggify.evaluate(site, rate))
+        })
     }
 }
 

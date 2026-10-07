@@ -11,6 +11,7 @@ use commonware_runtime::{
         Write,
         paged::{CHECKSUM_SIZE, CacheRef, Recovery as PagedRecovery},
     },
+    buggify,
     telemetry::metrics::{Counter, Gauge, GaugeExt, MetricsExt as _},
 };
 use futures::future::try_join_all;
@@ -389,11 +390,13 @@ impl<E: Storage + Metrics, F: BufferFactory<E::Blob>> Manager<E, F> {
     /// drops the extracted sections.
     async fn sync_selected(&mut self, selected: impl Fn(u64) -> bool) -> Result<(), Error> {
         let mut count = 0;
+        let context = &self.context;
         let futures: Vec<_> = self
             .blobs
             .extract_if(.., |&section, blob| {
                 if !selected(section) {
-                    return false;
+                    // Making unselected sections durable early is always allowed.
+                    return blob.needs_sync() && buggify!(context);
                 }
                 count += 1;
                 blob.needs_sync()
