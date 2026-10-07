@@ -1,14 +1,15 @@
-use crate::{Error, IoBufs, mocks};
+use crate::{Error, IoBufs};
+use bytes::{Bytes, BytesMut};
 use commonware_utils::{channel::mpsc, sync::Mutex};
 use std::{
     cell::Cell,
-    collections::HashMap,
-    future::Future,
+    collections::{BTreeSet, HashMap, VecDeque},
+    future::{Future, poll_fn},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::Range,
     pin::Pin,
-    sync::{Arc, OnceLock},
-    task::{Context, Poll},
+    sync::{Arc, OnceLock, Weak},
+    task::{Context, Poll, Waker},
     time::{Duration, SystemTime},
 };
 
@@ -136,10 +137,25 @@ pub trait Policy<A = SocketAddr>: Send + Sync {
     fn delivers(&self, transmission: &Transmission<'_, A>) -> Delivery;
 }
 
+/// A shared policy decides as the policy it points to (so a test can keep a handle to a policy
+/// it installs, for example to change it while the simulation runs).
+impl<A, P: Policy<A> + ?Sized> Policy<A> for Arc<P> {
+    fn connects(&self, from: &A, to: &A) -> bool {
+        (**self).connects(from, to)
+    }
+
+    fn delivers(&self, transmission: &Transmission<'_, A>) -> Delivery {
+        (**self).delivers(transmission)
+    }
+}
+
+/// Resolves once a [Timer]'s delay has passed.
+pub(crate) type Sleep = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
+
 /// A source of simulated time, installed by the runtime that owns the [Network].
 pub(crate) trait Timer: Send + Sync {
     /// Resolves once `delay` of simulated time has passed.
-    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+    fn sleep(&self, delay: Duration) -> Sleep;
 
     /// The current simulated time.
     fn now(&self) -> SystemTime;
@@ -148,31 +164,133 @@ pub(crate) trait Timer: Send + Sync {
 /// Filled once the owning runtime exists; the network is created before its executor.
 pub(crate) type TimerSlot = Arc<OnceLock<Arc<dyn Timer>>>;
 
+/// Default number of bytes a connection holds in each direction (in flight or arrived but not yet
+/// read) before sends block, as a TCP send buffer and receive window would.
+pub const DEFAULT_WINDOW: usize = 4 * 1024 * 1024;
+
+/// Number of bytes a [Stream] moves into its local (peekable) buffer per receive, at least.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Bytes sent on a connection, readable once `arrival` (if any) has passed.
+struct Segment {
+    arrival: Option<SystemTime>,
+    data: Bytes,
+}
+
+/// One direction of a deterministic connection.
+///
+/// Sent bytes are queued with the time they arrive and become readable, in order, once it has
+/// passed: a connection carries latency as propagation delay, so a send does not wait for its
+/// bytes to arrive. Sends block only while more than `window` bytes are in flight or unread.
+struct Wire {
+    in_flight: VecDeque<Segment>,
+    /// Bytes queued in `in_flight`.
+    pending: usize,
+    window: usize,
+    /// Arrival of the last queued segment (later segments never arrive before it).
+    last_arrival: Option<SystemTime>,
+    /// Whether the sending half has been dropped (closing the direction gracefully).
+    sink_closed: bool,
+    /// Whether the connection has been reset (losing everything still queued).
+    reset: bool,
+    /// Whether the receiving half is still alive.
+    stream_alive: bool,
+    reader: Option<Waker>,
+    writer: Option<Waker>,
+}
+
+impl Wire {
+    fn new(window: usize) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            in_flight: VecDeque::new(),
+            pending: 0,
+            window,
+            last_arrival: None,
+            sink_closed: false,
+            reset: false,
+            stream_alive: true,
+            reader: None,
+            writer: None,
+        }))
+    }
+
+    /// Queue `data` to arrive at `arrival` (or immediately), but never before earlier bytes.
+    fn push(&mut self, arrival: Option<SystemTime>, data: Bytes) {
+        let arrival = match (self.last_arrival, arrival) {
+            (Some(last), Some(arrival)) => Some(last.max(arrival)),
+            (last, arrival) => last.or(arrival),
+        };
+        self.last_arrival = arrival;
+        self.pending += data.len();
+        self.in_flight.push_back(Segment { arrival, data });
+        if let Some(reader) = self.reader.take() {
+            reader.wake();
+        }
+    }
+
+    /// Reset the direction, losing every queued byte.
+    fn reset(&mut self) {
+        self.reset = true;
+        self.in_flight.clear();
+        self.pending = 0;
+        if let Some(reader) = self.reader.take() {
+            reader.wake();
+        }
+        if let Some(writer) = self.writer.take() {
+            writer.wake();
+        }
+    }
+}
+
+/// An ephemeral port held by a dialer until both halves of its connection are dropped.
+struct Port {
+    ports: Weak<Mutex<Ports>>,
+    key: (IpAddr, SocketAddr),
+    port: u16,
+}
+
+impl Drop for Port {
+    fn drop(&mut self) {
+        if let Some(ports) = self.ports.upgrade() {
+            let mut ports = ports.lock();
+            if let Some(pool) = ports.get_mut(&self.key) {
+                pool.used.remove(&self.port);
+                if pool.used.is_empty() {
+                    ports.remove(&self.key);
+                }
+            }
+        }
+    }
+}
+
+/// Ephemeral ports in use by connections from one source IP to one destination.
+struct Pool {
+    /// The next port to try (ports are handed out in rotation, so a released port is not reused
+    /// immediately).
+    next: u16,
+    used: BTreeSet<u16>,
+}
+
+/// Ephemeral ports in use, by source IP and destination: like TCP, a connection is identified by
+/// both endpoints, so a source port only needs to be unique per destination.
+type Ports = HashMap<(IpAddr, SocketAddr), Pool>;
+
 /// Implementation of [crate::Sink] for a deterministic [Network].
 pub struct Sink {
-    /// `None` once the connection has been reset.
-    inner: Option<mocks::Sink>,
+    wire: Arc<Mutex<Wire>>,
+    /// The opposite direction of the connection, reset along with this one.
+    reverse: Weak<Mutex<Wire>>,
     link: Link,
     sent: u64,
     policy: Option<Arc<dyn Policy>>,
     timer: TimerSlot,
+    /// Set while a send is in progress (a send canceled mid-flight poisons the sink) and once
+    /// the sink fails.
+    poisoned: bool,
+    _port: Option<Arc<Port>>,
 }
 
 impl Sink {
-    fn new(
-        inner: mocks::Sink,
-        link: Link,
-        policy: Option<Arc<dyn Policy>>,
-        timer: TimerSlot,
-    ) -> Self {
-        Self {
-            inner: Some(inner),
-            link,
-            sent: 0,
-            policy,
-            timer,
-        }
-    }
     fn timer(&self) -> Arc<dyn Timer> {
         self.timer
             .get()
@@ -186,13 +304,30 @@ impl Sink {
         }
         self.timer().sleep(delay).await;
     }
+
+    /// Reset both directions of the connection, as a TCP reset would.
+    fn reset(&mut self) {
+        self.wire.lock().reset();
+        if let Some(reverse) = self.reverse.upgrade() {
+            reverse.lock().reset();
+        }
+    }
 }
 
-/// Flip `bit` (modulo the buffer's length in bits) of `bufs`.
-fn flip(bufs: IoBufs, bit: u64) -> IoBufs {
-    let mut bytes = bufs.coalesce().as_ref().to_vec();
+impl Drop for Sink {
+    fn drop(&mut self) {
+        let mut wire = self.wire.lock();
+        wire.sink_closed = true;
+        if let Some(reader) = wire.reader.take() {
+            reader.wake();
+        }
+    }
+}
+
+/// Flip `bit` (modulo the buffer's length in bits) of `bytes`.
+fn flip(bytes: &mut [u8], bit: u64) {
     if bytes.is_empty() {
-        return IoBufs::from(bytes);
+        return;
     }
     let bits = u64::try_from(bytes.len())
         .expect("bounded send")
@@ -200,69 +335,225 @@ fn flip(bufs: IoBufs, bit: u64) -> IoBufs {
     let bit = bit % bits;
     let byte = usize::try_from(bit / 8).expect("bit within the send");
     bytes[byte] ^= 1 << (bit % 8);
-    IoBufs::from(bytes)
 }
 
 /// Carries out [Delivery] outcomes on a byte stream:
 ///
-/// - `after` delays the send, holding back the sends behind it, as on a TCP stream.
+/// - `after` is propagation delay: the send completes once its bytes are queued, and they become
+///   readable `after` later, never before bytes sent earlier on the connection (as on a TCP
+///   stream).
 /// - [Fate::Drop] and [Fate::Reset] reset the connection, after stalling the send for `after`: a
-///   stream cannot lose bytes without breaking, and the peer's stream fails too.
+///   stream cannot lose bytes without breaking. Both directions fail, and bytes still in flight
+///   are lost.
 /// - `corrupt` flips a bit of the sent bytes.
-/// - `duplicate` sends the bytes again (after the extra delay), as a retransmission bug would.
+/// - `duplicate` delivers the bytes again (that long after the first copy), as a retransmission
+///   bug would.
+///
+/// A send blocks while more than the connection's window of bytes is in flight or unread.
 impl crate::Sink for Sink {
     async fn send(&mut self, bufs: impl Into<IoBufs> + Send) -> Result<(), Error> {
-        let mut bufs = bufs.into();
-        if self.inner.is_none() {
+        if self.poisoned {
             return Err(Error::Closed);
         }
-        let mut duplicate = None;
+        let bufs = bufs.into();
+        self.poisoned = true;
+        let mut delivery = Delivery::NOW;
+        let mut now = None;
         if let Some(policy) = &self.policy {
             let index = self.sent;
             self.sent = self.sent.checked_add(1).expect("send count overflow");
-            let delivery = policy.delivers(&Transmission {
+            let at = self.timer().now();
+            now = Some(at);
+            delivery = policy.delivers(&Transmission {
                 link: &self.link,
                 channel: None,
                 index,
                 len: bytes::Buf::remaining(&bufs),
-                at: self.timer().now(),
+                at,
             });
-            if delivery.fate != Fate::Deliver {
-                // The send stalls for `after` (as a TCP retransmission timeout would) before the
-                // connection breaks. Dropping the sink closes the pipe, so the peer's stream fails
-                // too.
-                self.sleep(delivery.after).await;
-                self.inner = None;
-                return Err(Error::Closed);
-            }
+        }
+        if delivery.fate != Fate::Deliver {
+            // The send stalls for `after` (as a TCP retransmission timeout would) before the
+            // connection breaks.
             self.sleep(delivery.after).await;
-            if let Some(bit) = delivery.corrupt {
-                bufs = flip(bufs, bit);
-            }
-            duplicate = delivery.duplicate.map(|after| (after, bufs.clone()));
-        }
-        let Some(inner) = self.inner.as_mut() else {
+            self.reset();
             return Err(Error::Closed);
-        };
-        inner.send(bufs).await?;
-        if let Some((after, bufs)) = duplicate {
-            self.sleep(after).await;
-            let Some(inner) = self.inner.as_mut() else {
-                return Err(Error::Closed);
-            };
-            inner.send(bufs).await?;
         }
-        Ok(())
+        let mut data = bufs.coalesce().as_ref().to_vec();
+        if let Some(bit) = delivery.corrupt {
+            flip(&mut data, bit);
+        }
+        let data = Bytes::from(data);
+        let at = |delay: Duration| {
+            (!delay.is_zero()).then(|| {
+                now.expect("delays are only decided by a policy")
+                    .checked_add(delay)
+                    .expect("arrival overflow")
+            })
+        };
+        {
+            let mut wire = self.wire.lock();
+            if wire.reset {
+                return Err(Error::Closed);
+            }
+            if !wire.stream_alive {
+                return Err(Error::SendFailed);
+            }
+            let arrival = at(delivery.after);
+            if let Some(extra) = delivery.duplicate {
+                wire.push(arrival, data.clone());
+                let again = delivery.after.checked_add(extra).expect("arrival overflow");
+                wire.push(at(again), data);
+            } else {
+                wire.push(arrival, data);
+            }
+        }
+
+        // Block while the window is exceeded
+        let wire = &self.wire;
+        let result = poll_fn(|cx| {
+            let mut wire = wire.lock();
+            if wire.reset {
+                return Poll::Ready(Err(Error::Closed));
+            }
+            if !wire.stream_alive {
+                return Poll::Ready(Err(Error::SendFailed));
+            }
+            if wire.pending <= wire.window {
+                return Poll::Ready(Ok(()));
+            }
+            wire.writer = Some(cx.waker().clone());
+            Poll::Pending
+        })
+        .await;
+        if result.is_ok() {
+            self.poisoned = false;
+        }
+        result
     }
 }
 
 /// Implementation of [crate::Stream] for a deterministic [Network].
-pub type Stream = mocks::Stream;
+pub struct Stream {
+    wire: Arc<Mutex<Wire>>,
+    timer: TimerSlot,
+    /// Arrived bytes not yet consumed.
+    buffer: BytesMut,
+    /// Wakes the stream when the next in-flight segment arrives.
+    sleep: Option<(SystemTime, Sleep)>,
+    /// Set while a receive is in progress (a receive canceled mid-flight poisons the stream)
+    /// and once the stream fails.
+    poisoned: bool,
+    _port: Option<Arc<Port>>,
+}
+
+impl Stream {
+    fn poll_recv(&mut self, cx: &mut Context<'_>, len: usize) -> Poll<Result<IoBufs, Error>> {
+        loop {
+            let mut wire = self.wire.lock();
+
+            // Move arrived bytes into the local buffer
+            let target = len.max(READ_CHUNK);
+            let mut now = None;
+            let mut next = None;
+            let mut pulled = false;
+            while self.buffer.len() < target {
+                let Some(front) = wire.in_flight.front_mut() else {
+                    break;
+                };
+                if let Some(arrival) = front.arrival {
+                    let current = *now.get_or_insert_with(|| {
+                        self.timer
+                            .get()
+                            .expect("delayed bytes need the runtime's timer")
+                            .now()
+                    });
+                    if arrival > current {
+                        next = Some((arrival, current));
+                        break;
+                    }
+                }
+                let take = front.data.len().min(target - self.buffer.len());
+                self.buffer.extend_from_slice(&front.data.split_to(take));
+                if front.data.is_empty() {
+                    wire.in_flight.pop_front();
+                }
+                wire.pending -= take;
+                pulled = true;
+            }
+            if pulled
+                && wire.pending <= wire.window
+                && let Some(writer) = wire.writer.take()
+            {
+                writer.wake();
+            }
+
+            if wire.reset {
+                self.buffer.clear();
+                return Poll::Ready(Err(Error::RecvFailed));
+            }
+            if self.buffer.len() >= len {
+                return Poll::Ready(Ok(IoBufs::from(self.buffer.split_to(len).freeze())));
+            }
+            if wire.sink_closed && wire.in_flight.is_empty() {
+                return Poll::Ready(Err(Error::RecvFailed));
+            }
+            wire.reader = Some(cx.waker().clone());
+            drop(wire);
+
+            // Wait for the next segment to arrive (or for a new one to be sent)
+            let Some((arrival, current)) = next else {
+                return Poll::Pending;
+            };
+            if self.sleep.as_ref().is_none_or(|(at, _)| *at != arrival) {
+                let timer = self.timer.get().expect("delayed bytes need the runtime's timer");
+                let delay = arrival.duration_since(current).expect("arrival is later");
+                self.sleep = Some((arrival, timer.sleep(delay)));
+            }
+            let (_, sleep) = self.sleep.as_mut().expect("sleep set above");
+            if sleep.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.sleep = None;
+        }
+    }
+}
+
+impl crate::Stream for Stream {
+    async fn recv(&mut self, len: usize) -> Result<IoBufs, Error> {
+        if self.poisoned {
+            return Err(Error::Closed);
+        }
+        self.poisoned = true;
+        let result = poll_fn(|cx| self.poll_recv(cx, len)).await;
+        if result.is_ok() {
+            self.poisoned = false;
+        }
+        result
+    }
+
+    fn peek(&self, max_len: usize) -> &[u8] {
+        let len = max_len.min(self.buffer.len());
+        &self.buffer[..len]
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        let mut wire = self.wire.lock();
+        wire.stream_alive = false;
+        wire.in_flight.clear();
+        wire.pending = 0;
+        if let Some(writer) = wire.writer.take() {
+            writer.wake();
+        }
+    }
+}
 
 /// Implementation of [crate::Listener] for a deterministic [Network].
 pub struct Listener {
     address: SocketAddr,
-    listener: mpsc::UnboundedReceiver<(SocketAddr, Sink, mocks::Stream)>,
+    listener: mpsc::UnboundedReceiver<(SocketAddr, Sink, Stream)>,
 }
 
 impl crate::Listener for Listener {
@@ -279,11 +570,7 @@ impl crate::Listener for Listener {
     }
 }
 
-type Dialable = mpsc::UnboundedSender<(
-    SocketAddr,
-    Sink,          // Listener -> Dialer
-    mocks::Stream, // Dialer -> Listener
-)>;
+type Dialable = mpsc::UnboundedSender<(SocketAddr, Sink, Stream)>;
 
 std::thread_local! {
     /// The source IP of the dial being polled on this thread, if its dialer has one.
@@ -318,27 +605,33 @@ impl<F: Future> Future for Sourced<F> {
 /// Deterministic implementation of [crate::Network].
 ///
 /// A dialer is given an ephemeral port on its source IP: the IP set for its process (see
-/// [crate::deterministic::Process::set_ip]), or `127.0.0.1` without one.
+/// [crate::deterministic::Process::set_ip]), or `127.0.0.1` without one. Ports are drawn from the
+/// range `32768..61000` in rotation, skipping ports bound by a listener on the source IP and ports
+/// still used by a connection from the same source IP to the same destination (as in TCP, a
+/// connection is identified by both of its endpoints). A port is released once both halves of
+/// its connection are dropped. A dial fails if every port is in use for its source and
+/// destination. To keep things simple, it is not possible to bind to an ephemeral port on
+/// `127.0.0.1`.
 ///
-/// When a dialer connects to a listener, the listener is given a new ephemeral port
-/// from the range `32768..61000`. To keep things simple, it is not possible to
-/// bind to an ephemeral port. Likewise, if ports are not reused and when exhausted,
-/// the runtime will panic.
+/// Each direction of a connection holds up to [DEFAULT_WINDOW] bytes in flight or unread before
+/// sends block.
 #[derive(Clone)]
 pub struct Network {
-    ephemeral: Arc<Mutex<u16>>,
+    ports: Arc<Mutex<Ports>>,
     listeners: Arc<Mutex<HashMap<SocketAddr, Dialable>>>,
     policy: Option<Arc<dyn Policy>>,
     timer: TimerSlot,
+    window: usize,
 }
 
 impl Default for Network {
     fn default() -> Self {
         Self {
-            ephemeral: Arc::new(Mutex::new(EPHEMERAL_PORT_RANGE.start)),
+            ports: Arc::default(),
             listeners: Arc::new(Mutex::new(HashMap::new())),
             policy: None,
             timer: Arc::default(),
+            window: DEFAULT_WINDOW,
         }
     }
 }
@@ -351,6 +644,50 @@ impl Network {
             timer,
             ..Self::default()
         }
+    }
+
+    /// Hold up to `window` bytes in flight or unread in each direction of a connection before
+    /// sends block.
+    #[cfg(test)]
+    pub(crate) const fn with_window(mut self, window: usize) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// Reserve an ephemeral port for a connection from `source` to `destination`.
+    fn reserve(&self, source: IpAddr, destination: SocketAddr) -> Result<Arc<Port>, Error> {
+        let listeners = self.listeners.lock();
+        let mut ports = self.ports.lock();
+        let key = (source, destination);
+        let pool = ports.entry(key).or_insert_with(|| Pool {
+            next: EPHEMERAL_PORT_RANGE.start,
+            used: BTreeSet::new(),
+        });
+        for _ in EPHEMERAL_PORT_RANGE {
+            let port = pool.next;
+            pool.next = if port + 1 == EPHEMERAL_PORT_RANGE.end {
+                EPHEMERAL_PORT_RANGE.start
+            } else {
+                port + 1
+            };
+            if pool.used.contains(&port)
+                || listeners
+                    .get(&SocketAddr::new(source, port))
+                    .is_some_and(|listener| !listener.is_closed())
+            {
+                continue;
+            }
+            pool.used.insert(port);
+            return Ok(Arc::new(Port {
+                ports: Arc::downgrade(&self.ports),
+                key,
+                port,
+            }));
+        }
+        if pool.used.is_empty() {
+            ports.remove(&key);
+        }
+        Err(Error::ConnectionFailed)
     }
 }
 
@@ -386,23 +723,17 @@ impl crate::Network for Network {
     }
 
     async fn dial(&self, socket: SocketAddr) -> Result<(Sink, Stream), Error> {
-        // Assign dialer a port from the ephemeral range on its source IP
-        let source = DIAL_SOURCE.get().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        let dialer = {
-            let mut ephemeral = self.ephemeral.lock();
-            let dialer = SocketAddr::new(source, *ephemeral);
-            *ephemeral = ephemeral
-                .checked_add(1)
-                .expect("ephemeral port range exhausted");
-            dialer
-        };
-
         // Get listener
         let sender = {
             let listeners = self.listeners.lock();
             let sender = listeners.get(&socket).ok_or(Error::ConnectionFailed)?;
             sender.clone()
         };
+
+        // Assign dialer a port from the ephemeral range on its source IP
+        let source = DIAL_SOURCE.get().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let port = self.reserve(source, socket)?;
+        let dialer = SocketAddr::new(source, port.port);
 
         if self
             .policy
@@ -413,46 +744,59 @@ impl crate::Network for Network {
         }
 
         // Construct connection
-        let (dialer_sender, dialer_receiver) = mocks::Channel::init();
-        let (listener_sender, listener_receiver) = mocks::Channel::init();
-        let to_dialer = Link {
-            from: socket,
-            to: dialer,
+        let to_listener = Wire::new(self.window);
+        let to_dialer = Wire::new(self.window);
+        let sink = |wire: &Arc<Mutex<Wire>>, reverse: &Arc<Mutex<Wire>>, link, port| Sink {
+            wire: wire.clone(),
+            reverse: Arc::downgrade(reverse),
+            link,
+            sent: 0,
+            policy: self.policy.clone(),
+            timer: self.timer.clone(),
+            poisoned: false,
+            _port: port,
         };
-        let to_listener = Link {
-            from: dialer,
-            to: socket,
+        let stream = |wire: &Arc<Mutex<Wire>>, port| Stream {
+            wire: wire.clone(),
+            timer: self.timer.clone(),
+            buffer: BytesMut::new(),
+            sleep: None,
+            poisoned: false,
+            _port: port,
         };
+        let listener_sink = sink(
+            &to_dialer,
+            &to_listener,
+            Link {
+                from: socket,
+                to: dialer,
+            },
+            None,
+        );
+        let listener_stream = stream(&to_listener, None);
         sender
-            .send((
-                dialer,
-                Sink::new(
-                    dialer_sender,
-                    to_dialer,
-                    self.policy.clone(),
-                    self.timer.clone(),
-                ),
-                listener_receiver,
-            ))
+            .send((dialer, listener_sink, listener_stream))
             .map_err(|_| Error::ConnectionFailed)?;
-        Ok((
-            Sink::new(
-                listener_sender,
-                to_listener,
-                self.policy.clone(),
-                self.timer.clone(),
-            ),
-            dialer_receiver,
-        ))
+        let dialer_sink = sink(
+            &to_listener,
+            &to_dialer,
+            Link {
+                from: dialer,
+                to: socket,
+            },
+            Some(port.clone()),
+        );
+        Ok((dialer_sink, stream(&to_dialer, Some(port))))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        Clock, Runner, Spawner,
+        Clock, Error, Runner, Spawner,
         network::{deterministic as DeterministicNetwork, tests},
     };
+    use std::net::SocketAddr;
     use commonware_macros::test_group;
     use rstest::rstest;
 
@@ -468,6 +812,64 @@ mod tests {
     {
         runner.start(|context| async move {
             tests::test_network_trait(context, DeterministicNetwork::Network::default).await;
+        });
+    }
+
+    #[test]
+    fn test_window_blocks_sends() {
+        use crate::{Listener as _, Network as _, Sink as _, Stream as _};
+        crate::deterministic::Runner::default().start(|_| async move {
+            let network = DeterministicNetwork::Network::default().with_window(8);
+            let address = SocketAddr::from(([10, 0, 0, 1], 3000));
+            let mut listener = network.bind(address).await.unwrap();
+            let (mut sink, _stream) = network.dial(address).await.unwrap();
+            let (_, _, mut stream) = listener.accept().await.unwrap();
+
+            // A send that fits the window completes; one that exceeds it blocks until read
+            sink.send(vec![1u8; 8]).await.unwrap();
+            let mut blocked = Box::pin(sink.send(vec![2u8; 4]));
+            assert!(futures::poll!(blocked.as_mut()).is_pending());
+            assert_eq!(stream.recv(8).await.unwrap().coalesce(), [1u8; 8].as_slice());
+            blocked.await.unwrap();
+            assert_eq!(stream.recv(4).await.unwrap().coalesce(), [2u8; 4].as_slice());
+        });
+    }
+
+    #[test]
+    fn test_ephemeral_ports_per_destination() {
+        use crate::{Listener as _, Network as _};
+        crate::deterministic::Runner::default().start(|_| async move {
+            let network = DeterministicNetwork::Network::default();
+            let range = super::EPHEMERAL_PORT_RANGE;
+            let ports = usize::from(range.end - range.start);
+
+            // Many more connections than ports, spread over destinations, all coexist
+            let mut listeners = Vec::new();
+            for i in 0..4u8 {
+                let address = SocketAddr::from(([10, 0, 0, i + 1], 3000));
+                listeners.push((address, network.bind(address).await.unwrap()));
+            }
+            let mut connections = Vec::new();
+            for (address, _) in &listeners {
+                for _ in 0..ports {
+                    connections.push(network.dial(*address).await.unwrap());
+                }
+            }
+
+            // A destination whose ports are all in use refuses further dials until one is released
+            let (address, listener) = &mut listeners[0];
+            assert!(matches!(
+                network.dial(*address).await,
+                Err(Error::ConnectionFailed)
+            ));
+            let (dialer, _, _) = listener.accept().await.unwrap();
+            connections.swap_remove(0);
+            let (_sink, _stream) = network.dial(*address).await.unwrap();
+            let mut last = None;
+            while let Some(Ok((port, _, _))) = futures::FutureExt::now_or_never(listener.accept()) {
+                last = Some(port);
+            }
+            assert_eq!(last.unwrap(), dialer, "the released port is reused");
         });
     }
 

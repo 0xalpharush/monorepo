@@ -266,6 +266,8 @@ use buggify::Buggify;
 pub use buggify::{BuggifyPolicy, Seeded as SeededBuggify};
 mod nemesis;
 pub use nemesis::{Jitter, Partitions, Swizzle, SwizzleStep};
+mod topology;
+pub use topology::{Bandwidth, LinkConfig, Topology};
 mod scheduling;
 pub use scheduling::{DelayBounded, Pausing, Pct, RandomWalk};
 mod zone;
@@ -2425,7 +2427,7 @@ impl Clock for Context {
 struct ExecutorTimer(Weak<Executor>);
 
 impl Timer for ExecutorTimer {
-    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn sleep(&self, delay: Duration) -> crate::network::deterministic::Sleep {
         let executor = self.0.upgrade().expect("executor already dropped");
         let time = executor
             .time
@@ -4049,15 +4051,16 @@ mod tests {
             let mut listener = ctx.bind(address).await.unwrap();
             let (mut sink, _stream) = ctx.dial(address).await.unwrap();
             let (_, _, mut stream) = listener.accept().await.unwrap();
-            sink.send(b"abcd".to_vec()).await.unwrap();
             let start = ctx.current();
+            sink.send(b"abcd".to_vec()).await.unwrap();
             sink.send(b"xy".to_vec()).await.unwrap();
+            assert_eq!(ctx.current(), start, "sends do not wait for their bytes to arrive");
+            // Bit 5 of byte 2 flipped, then the duplicated send twice (the copy arriving later).
+            assert_eq!(stream.recv(8).await.unwrap().coalesce(), b"abCdxyxy");
             assert_eq!(
                 ctx.current().duration_since(start).unwrap(),
                 Duration::from_millis(10)
             );
-            // Bit 5 of byte 2 flipped, then the duplicated send twice.
-            assert_eq!(stream.recv(8).await.unwrap().coalesce(), b"abCdxyxy");
             // A stream cannot lose bytes without breaking: the drop resets the connection.
             assert!(matches!(sink.send(b"z".to_vec()).await, Err(Error::Closed)));
             assert!(stream.recv(1).await.is_err());
@@ -4082,12 +4085,14 @@ mod tests {
             let (_, _, mut stream) = listener.accept().await.unwrap();
             let start = ctx.current();
             sink.send(b"first".to_vec()).await.unwrap();
+            sink.send(b"second".to_vec()).await.unwrap();
+            assert_eq!(ctx.current(), start, "sends do not wait for their bytes to arrive");
+            // The undelayed second send does not overtake the delayed first one
+            assert_eq!(stream.recv(11).await.unwrap().coalesce(), b"firstsecond");
             assert_eq!(
                 ctx.current().duration_since(start).unwrap(),
                 Duration::from_millis(250)
             );
-            sink.send(b"second".to_vec()).await.unwrap();
-            assert_eq!(stream.recv(11).await.unwrap().coalesce(), b"firstsecond");
             assert!(matches!(
                 sink.send(b"third".to_vec()).await,
                 Err(Error::Closed)

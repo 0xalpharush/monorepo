@@ -105,7 +105,8 @@ struct State<H> {
 ///   Sends in the uncut direction are still delivered until then.
 /// - A clogged link (see [Self::clog]) holds all traffic sent on it until the clog expires, then
 ///   releases it in order, after the latency the inner policy decides. On sockets, a send on a
-///   clogged link stalls until then. A clog cannot be lifted early: traffic is held until its
+///   clogged link completes once queued, and its bytes arrive once the clog expires (sends
+///   block only once the connection's window fills). A clog cannot be lifted early: traffic is held until its
 ///   scheduled release even after [Self::heal], as the bytes already sit in a stalled queue.
 ///
 /// Every other decision (and the latency of every transmission) is the inner policy's, which is
@@ -660,7 +661,8 @@ mod tests {
             drop(_listener);
             let (mut sink, mut stream, _, _) = connect(&context, &nodes[1].0, address(3)).await;
 
-            // Clog 2 -> 3 for a second: sends stall until the clog clears, then arrive in order
+            // Clog 2 -> 3 for a second: sends are held until the clog clears, then arrive in
+            // order
             partitions.clog(&context, host(2), host(3), Duration::from_secs(1));
             assert!(
                 partitions
@@ -670,12 +672,10 @@ mod tests {
             let start = context.current();
             sink.send(b"a".to_vec()).await.unwrap();
             sink.send(b"b".to_vec()).await.unwrap();
-            let elapsed = context.current().duration_since(start).unwrap();
-            assert_eq!(
-                elapsed,
-                Duration::from_secs(1) + Duration::from_millis(5) + Duration::from_millis(5)
-            );
+            assert_eq!(context.current(), start, "sends on a clogged link are queued");
             assert_eq!(stream.recv(2).await.unwrap().coalesce(), b"ab");
+            let elapsed = context.current().duration_since(start).unwrap();
+            assert_eq!(elapsed, Duration::from_secs(1) + Duration::from_millis(5));
             assert!(
                 partitions
                     .clogged_until(&context, &host(2), &host(3))
