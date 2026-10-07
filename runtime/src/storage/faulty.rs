@@ -2,7 +2,7 @@
 
 use crate::{
     BlobVersion, Error, Handle, IoBufs, IoBufsMut, ReadOptions, WriteOptions,
-    deterministic::BoxDynRng,
+    deterministic::BoxDynRng, network::deterministic::Timer,
 };
 use bytes::Buf;
 use commonware_utils::{
@@ -19,6 +19,7 @@ use std::{
         Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 /// Operation types for fault injection.
@@ -143,6 +144,16 @@ pub struct Config {
     /// synchronization (so a crash resolves it like any other unsynchronized write), a sync is
     /// not performed, and the operation never completes.
     pub crash_rate: Option<Probability>,
+
+    /// Range each blob operation's (and scan's) latency is drawn from. While an operation waits,
+    /// other tasks and simulated time keep moving, so a crash or pause can land in the middle of
+    /// it. Opens and removes complete immediately. An empty or inverted range is a fixed latency
+    /// of its start.
+    pub latency: Option<Range<Duration>>,
+
+    /// Probability that a successful `read_at` returns the same number of bytes from a different
+    /// offset of the same blob, as a misdirected read would. Durable contents are unchanged.
+    pub misdirect_read_rate: Option<Probability>,
 }
 
 impl Config {
@@ -213,6 +224,18 @@ impl Config {
         self.crash_rate = Some(rate);
         self
     }
+
+    /// Set the range each storage operation's latency is drawn from.
+    pub const fn latency(mut self, range: Range<Duration>) -> Self {
+        self.latency = Some(range);
+        self
+    }
+
+    /// Set the probability that a read returns data from a different offset of the blob.
+    pub const fn misdirect_read(mut self, rate: Probability) -> Self {
+        self.misdirect_read_rate = Some(rate);
+        self
+    }
 }
 
 /// What one storage fault decision determines.
@@ -237,6 +260,12 @@ pub enum Draw {
     CorruptBit,
     /// Whether a write or sync crashes the process that owns its partition.
     Crash,
+    /// An operation's latency in nanoseconds.
+    Latency,
+    /// Whether a successful read returns data from a different offset.
+    MisdirectRead,
+    /// The offset a misdirected read returns data from.
+    MisdirectOffset,
 }
 
 /// One storage fault decision: the file and operation it concerns, and what it determines.
@@ -285,7 +314,11 @@ struct Oracle {
     policy: Arc<dyn Policy>,
     config: Arc<RwLock<Config>>,
     crasher: CrasherSlot,
+    timer: TimerSlot,
 }
+
+/// Times storage latency, installed by the owning runtime and emptied when it shuts down.
+pub(crate) type TimerSlot = Arc<Mutex<Option<Arc<dyn Timer>>>>;
 
 /// Crashes the simulated processes that own partitions, installed by the owning runtime.
 pub(crate) trait Crasher: Send + Sync {
@@ -294,6 +327,9 @@ pub(crate) trait Crasher: Send + Sync {
 
     /// Crash the process that owns `partition`.
     fn crash(&self, partition: &str);
+
+    /// Whether the disk of the process that owns `partition` is full.
+    fn disk_full(&self, partition: &str) -> bool;
 }
 
 /// Filled once the owning runtime exists (storage is created before its executor) and emptied
@@ -460,6 +496,67 @@ impl Oracle {
 
     /// Check if a write fault should be injected.
     /// Reads config once to avoid nested lock acquisition.
+    /// Wait out the latency of the operation `decision` describes, if latency is configured.
+    async fn delay(&self, decision: &Decision<'_>) {
+        let Some(range) = self.config.read().latency.clone() else {
+            return;
+        };
+        let start = u64::try_from(range.start.as_nanos()).expect("bounded latency");
+        let end = u64::try_from(range.end.as_nanos()).expect("bounded latency");
+        let nanos = if end > start {
+            self.policy.between(
+                &Decision {
+                    draw: Draw::Latency,
+                    ..*decision
+                },
+                start..end,
+            )
+        } else {
+            start
+        };
+        if nanos == 0 {
+            return;
+        }
+        let timer = self.timer.lock().clone();
+        if let Some(timer) = timer {
+            timer.sleep(Duration::from_nanos(nanos)).await;
+        }
+    }
+
+    /// The offset a read of `len` bytes at `offset` from a blob of `size` bytes actually reads.
+    ///
+    /// Makes no draw when misdirected reads are disabled or no other offset fits the read.
+    fn read_offset(&self, file: &FileGeneration, offset: u64, len: usize, size: u64) -> u64 {
+        let Some(rate) = self
+            .config
+            .read()
+            .misdirect_read_rate
+            .filter(|rate| !rate.is_zero())
+        else {
+            return offset;
+        };
+        let len = u64::try_from(len).expect("bounded read");
+        let Some(last) = size.checked_sub(len).filter(|last| *last > 0) else {
+            return offset;
+        };
+        if len == 0
+            || offset > last
+            || !self.roll(&file.decision(Op::Read, Draw::MisdirectRead), rate)
+        {
+            return offset;
+        }
+        let other = self
+            .policy
+            .between(&file.decision(Op::Read, Draw::MisdirectOffset), 0..last);
+        if other >= offset { other + 1 } else { other }
+    }
+
+    /// Whether `file`'s partition is on a full disk.
+    fn full(&self, file: &FileGeneration) -> bool {
+        let crasher = self.crasher.lock().clone();
+        crasher.is_some_and(|crasher| crasher.disk_full(&file.file.0))
+    }
+
     /// Check whether `op` on `file` crashes the process that owns it. Draws only when crashes
     /// are enabled and a live process owns the file's partition.
     fn should_crash(&self, file: &FileGeneration, op: Op) -> bool {
@@ -640,6 +737,7 @@ impl<S: crate::Storage> Storage<S> {
                 policy,
                 config,
                 crasher: Arc::default(),
+                timer: Arc::default(),
             },
             pending: Arc::new(Mutex::new(Vec::new())),
             generations: Arc::new(Mutex::new(BTreeMap::new())),
@@ -649,6 +747,11 @@ impl<S: crate::Storage> Storage<S> {
     /// Get a reference to the inner storage.
     pub const fn inner(&self) -> &S {
         &self.inner
+    }
+
+    /// The slot the owning runtime installs its storage latency timer into.
+    pub(crate) fn timer(&self) -> TimerSlot {
+        self.ctx.timer.clone()
     }
 
     /// The slot the owning runtime installs its [Crasher] into.
@@ -828,6 +931,10 @@ fn injected_io_error() -> IoError {
     IoError::other("injected storage fault")
 }
 
+fn storage_full() -> IoError {
+    IoError::new(std::io::ErrorKind::StorageFull, "simulated disk is full")
+}
+
 impl<S: crate::Storage> crate::Storage for Storage<S> {
     type Blob = Blob<S::Blob>;
 
@@ -860,12 +967,14 @@ impl<S: crate::Storage> crate::Storage for Storage<S> {
     }
 
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
-        if self.ctx.should_fail(&Decision {
+        let decision = Decision {
             partition,
             name: None,
             op: Op::Scan,
             draw: Draw::Fail,
-        }) {
+        };
+        self.ctx.delay(&decision).await;
+        if self.ctx.should_fail(&decision) {
             return Err(injected_io_error().into());
         }
         self.inner.scan(partition).await
@@ -1045,12 +1154,21 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         if self.generation.crashed() {
             return futures::future::pending().await;
         }
+        self.ctx
+            .delay(&self.generation.decision(Op::Read, Draw::Latency))
+            .await;
         if self
             .ctx
             .should_fail(&self.generation.decision(Op::Read, Draw::Fail))
         {
             return Err(injected_io_error().into());
         }
+        let offset = self.ctx.read_offset(
+            &self.generation,
+            offset,
+            len,
+            self.size.load(Ordering::Relaxed),
+        );
         let mut bufs = self.inner.read_at(offset, len, options).await?;
         self.ctx.corrupt_read(&self.generation, &mut bufs);
         Ok(bufs)
@@ -1066,12 +1184,21 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         if self.generation.crashed() {
             return futures::future::pending().await;
         }
+        self.ctx
+            .delay(&self.generation.decision(Op::Read, Draw::Latency))
+            .await;
         if self
             .ctx
             .should_fail(&self.generation.decision(Op::Read, Draw::Fail))
         {
             return Err(injected_io_error().into());
         }
+        let offset = self.ctx.read_offset(
+            &self.generation,
+            offset,
+            len,
+            self.size.load(Ordering::Relaxed),
+        );
         let mut bufs = self
             .inner
             .read_at_buf(offset, len, bufs.into(), options)
@@ -1089,6 +1216,9 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         if self.generation.crashed() {
             return futures::future::pending().await;
         }
+        self.ctx
+            .delay(&self.generation.decision(Op::Write, Draw::Latency))
+            .await;
         let bufs = bufs.into();
         let total_bytes = bufs.remaining() as u64;
         let sync = options.contains(WriteOptions::SYNC);
@@ -1098,6 +1228,11 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         offset
             .checked_add(total_bytes)
             .ok_or(Error::OffsetOverflow)?;
+        if offset.saturating_add(total_bytes) > self.size.load(Ordering::Relaxed)
+            && self.ctx.full(&self.generation)
+        {
+            return Err(storage_full().into());
+        }
         let (should_fail, write_retention) = self.ctx.check_write_fault(&self.generation);
         if !should_fail && self.ctx.should_crash(&self.generation, Op::Write) {
             {
@@ -1188,6 +1323,12 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         if self.generation.crashed() {
             return futures::future::pending().await;
         }
+        self.ctx
+            .delay(&self.generation.decision(Op::Resize, Draw::Latency))
+            .await;
+        if len > self.size.load(Ordering::Relaxed) && self.ctx.full(&self.generation) {
+            return Err(storage_full().into());
+        }
         let (should_fail, partial_rate, retain) = self.ctx.check_resize_fault(&self.generation);
         let _mutation = self.generation.mutation.lock().await;
         if should_fail {
@@ -1215,6 +1356,9 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         if self.generation.crashed() {
             return futures::future::pending().await;
         }
+        self.ctx
+            .delay(&self.generation.decision(Op::Sync, Draw::Latency))
+            .await;
         if self
             .ctx
             .should_fail(&self.generation.decision(Op::Sync, Draw::Fail))
@@ -1235,6 +1379,9 @@ impl<B: crate::Blob> crate::Blob for Blob<B> {
         if self.generation.crashed() {
             return futures::future::pending().await;
         }
+        self.ctx
+            .delay(&self.generation.decision(Op::Sync, Draw::Latency))
+            .await;
         if self
             .ctx
             .should_fail(&self.generation.decision(Op::Sync, Draw::Fail))
