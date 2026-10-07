@@ -1755,6 +1755,8 @@ impl Context {
             parent: context.process.take(),
             paused: AtomicBool::new(false),
             clock: Mutex::new(ProcessClock::default()),
+            contain: AtomicBool::new(false),
+            panic: Mutex::new(None),
         });
         context.process = Some(Arc::clone(&state));
         let host = Arc::new(ProcessHost {
@@ -1832,13 +1834,17 @@ impl crate::Spawner for Context {
         let guard = FactoryGuard::new(&parent, metric);
         let executor = self.executor();
         let process = self.process.clone();
-        let future = f(self);
-        let (f, handle) = Handle::init(
-            future,
-            guard.disarm(),
-            executor.panicker.clone(),
-            Arc::clone(&parent),
+        let panicker = process.as_ref().map_or_else(
+            || executor.panicker.clone(),
+            |process| {
+                let process = Arc::clone(process);
+                executor
+                    .panicker
+                    .containing(Arc::new(move |message: &str| process.contain(message)))
+            },
         );
+        let future = f(self);
+        let (f, handle) = Handle::init(future, guard.disarm(), panicker, Arc::clone(&parent));
         Tasks::register_work(&executor.tasks, label, process, Box::pin(f));
 
         handle
@@ -2056,6 +2062,25 @@ impl Process {
         clock.drift = i128::from(ppm);
     }
 
+    /// Contain panics in the process, as a panicking program exits without taking its host down.
+    ///
+    /// Afterwards, a panic in any task of the process (or of a process started from its context
+    /// that does not contain panics itself) no longer reaches the runtime, whether or not the
+    /// runtime catches panics: the panicking task ends (its [Handle] resolves to
+    /// [Error::Exited]), every other task of the process is held back as if paused (and
+    /// [Self::resume] does not release them), and [Self::panicked] returns the first panic's
+    /// message. Crash the process to drop its tasks, then restart it from a new process.
+    pub fn contain_panics(&self) {
+        self.executor().auditor.event(b"contain_panics", |_| {});
+        self.host.state.contain.store(true, AtomicOrdering::Relaxed);
+    }
+
+    /// The message of the first panic the process contained, if any (see
+    /// [Self::contain_panics]).
+    pub fn panicked(&self) -> Option<String> {
+        self.host.state.panic.lock().clone()
+    }
+
     fn executor(&self) -> Arc<Executor> {
         self.executor.upgrade().expect("executor already dropped")
     }
@@ -2087,6 +2112,11 @@ struct ProcessState {
     paused: AtomicBool,
     /// How this process's clock departs from its parent's.
     clock: Mutex<ProcessClock>,
+    /// Whether panics in this process are contained (see [Process::contain_panics]).
+    contain: AtomicBool,
+    /// The first contained panic's message; once set, the process's tasks are held back until
+    /// a crash drops them.
+    panic: Mutex<Option<String>>,
 }
 
 /// Parts per million in a whole.
@@ -2127,10 +2157,24 @@ impl ProcessState {
                 .is_some_and(|parent| parent.within(ancestor))
     }
 
-    /// Whether this process or any process it was started from is paused.
+    /// Whether this process or any process it was started from is paused or halted by a
+    /// contained panic.
     fn paused(&self) -> bool {
         self.paused.load(AtomicOrdering::Relaxed)
+            || self.panic.lock().is_some()
             || self.parent.as_ref().is_some_and(|parent| parent.paused())
+    }
+
+    /// Contain a panic with `message` in the nearest process (this one or one it was started
+    /// from) that contains panics, halting it. Returns whether the panic was contained.
+    fn contain(&self, message: &str) -> bool {
+        if self.contain.load(AtomicOrdering::Relaxed) {
+            self.panic.lock().get_or_insert_with(|| message.to_string());
+            return true;
+        }
+        self.parent
+            .as_ref()
+            .is_some_and(|parent| parent.contain(message))
     }
 
     /// Signed offset of this process's clock from the runtime's at runtime time `now`, in
@@ -4227,6 +4271,110 @@ mod tests {
             outer.resume();
             ctx.sleep(Duration::from_millis(5)).await;
             assert!(ticks.load(Ordering::SeqCst) > frozen);
+        });
+    }
+
+    #[test]
+    fn test_process_contained_panic_halts_only_that_process() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let (process_ctx, process) = ctx.process("node", |_| false);
+            process.contain_panics();
+            let ticks = ticker(process_ctx.child("ticker"));
+            let peer_ticks = ticker(ctx.child("peer"));
+            let handle = process_ctx.child("faulty").spawn(|ctx| async move {
+                ctx.sleep(Duration::from_millis(10)).await;
+                panic!("disk corrupted");
+            });
+            assert!(matches!(handle.await, Err(Error::Exited)));
+            assert_eq!(process.panicked().as_deref(), Some("disk corrupted"));
+
+            // The rest of the process is halted, and resuming does not release it.
+            let frozen = ticks.load(Ordering::SeqCst);
+            let peer_before = peer_ticks.load(Ordering::SeqCst);
+            process.resume();
+            ctx.sleep(Duration::from_millis(20)).await;
+            assert_eq!(ticks.load(Ordering::SeqCst), frozen, "halted tasks ran");
+            assert!(
+                peer_ticks.load(Ordering::SeqCst) > peer_before,
+                "peer stalled"
+            );
+            process.crash();
+        });
+    }
+
+    #[test]
+    fn test_process_contained_panic_reaches_nearest_containing_process() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let (host_ctx, host) = ctx.process("host", |_| false);
+            host.contain_panics();
+            let (child_ctx, child) = host_ctx.process("child", |_| false);
+            let host_ticks = ticker(host_ctx.child("ticker"));
+            let faulty = child_ctx
+                .child("faulty")
+                .spawn(|_| async move { panic!("child failed") });
+            assert!(matches!(faulty.await, Err(Error::Exited)));
+
+            // The panic halts the containing ancestor (and so the child with it).
+            assert_eq!(child.panicked(), None);
+            assert_eq!(host.panicked().as_deref(), Some("child failed"));
+            let frozen = host_ticks.load(Ordering::SeqCst);
+            ctx.sleep(Duration::from_millis(20)).await;
+            assert_eq!(
+                host_ticks.load(Ordering::SeqCst),
+                frozen,
+                "halted tasks ran"
+            );
+            host.crash();
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "uncontained")]
+    fn test_process_panic_without_containment_reaches_runtime() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let (process_ctx, _process) = ctx.process("node", |_| false);
+            let _ = process_ctx
+                .child("faulty")
+                .spawn(|_| async move { panic!("uncontained") })
+                .await;
+            ctx.sleep(Duration::from_millis(10)).await;
+        });
+    }
+
+    #[test]
+    fn test_process_crash_discards_tasks_halted_by_a_contained_panic() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let (process_ctx, process) = ctx.process("node", |partition| partition == "node");
+            process.contain_panics();
+            let (opened, held) = oneshot::channel();
+            let alive = Arc::new(());
+            let holder = Arc::clone(&alive);
+            process_ctx.child("holder").spawn(|ctx| async move {
+                let (blob, _) = ctx.open("node", b"log").await.unwrap();
+                let _ = opened.send(());
+                pending::<()>().await;
+                drop((blob, holder));
+            });
+            held.await.unwrap();
+            let faulty = process_ctx
+                .child("faulty")
+                .spawn(|_| async move { panic!("disk corrupted") });
+            assert!(matches!(faulty.await, Err(Error::Exited)));
+
+            // Crashing the halted process drops its tasks before returning, so a restart can
+            // reopen its blobs immediately and run normally.
+            process.crash();
+            assert_eq!(Arc::strong_count(&alive), 1, "halted task was not dropped");
+            let (restarted_ctx, restarted) = ctx.process("node", |partition| partition == "node");
+            restarted.contain_panics();
+            restarted_ctx.open("node", b"log").await.unwrap();
+            assert_eq!(restarted.panicked(), None);
+            let ticks = ticker(restarted_ctx.child("ticker"));
+            ctx.sleep(Duration::from_millis(10)).await;
+            assert!(
+                ticks.load(Ordering::SeqCst) > 0,
+                "restarted process is halted"
+            );
         });
     }
 
