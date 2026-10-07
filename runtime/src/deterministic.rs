@@ -672,6 +672,38 @@ impl Executor {
         }
     }
 
+    /// Drop the futures of every task of the process `state` (or of processes started from its
+    /// context). A task being polled right now (one crashed from within its own storage
+    /// operation) is skipped; it was aborted, so it is dropped once it is next polled.
+    fn drop_process_tasks(&self, state: &ProcessState) {
+        let tasks: Vec<_> = self
+            .tasks
+            .running
+            .lock()
+            .values()
+            .filter(|task| {
+                task.process
+                    .as_ref()
+                    .is_some_and(|process| process.within(state))
+            })
+            .cloned()
+            .collect();
+        for task in tasks {
+            let Mode::Work(future) = &task.mode else {
+                continue;
+            };
+            let Some(mut slot) = future.try_lock() else {
+                continue;
+            };
+            let dropped = slot.take();
+            drop(slot);
+
+            // Dropping a future may wake or spawn tasks, so no lock is held
+            drop(dropped);
+            self.tasks.remove(task.id);
+        }
+    }
+
     /// Requeue every parked task; those whose process is still paused park again.
     fn unpark(&self) {
         let parked = take(&mut *self.parked.lock());
@@ -1896,9 +1928,12 @@ impl ProcessHost {
         self.crashed.store(true, AtomicOrdering::Relaxed);
         executor.auditor.event(b"crash_process", |_| {});
 
-        // Aborted tasks parked by a pause are dropped once polled
         self.state.paused.store(false, AtomicOrdering::Relaxed);
         executor.unpark();
+
+        // Drop the aborted tasks now, so their blobs, listeners, and connections are released
+        // before the crash returns
+        executor.drop_process_tasks(&self.state);
         self.storage
             .inner()
             .inner()
@@ -1910,14 +1945,13 @@ impl ProcessHost {
 impl Process {
     /// Crash the process, as a power loss on its host would.
     ///
-    /// Every task of the process is aborted before this returns, so none of them runs again
-    /// (unlike [Handle::abort], which aborts descendants once the aborted task is next polled).
-    /// Its listeners and connections close as their tasks are dropped. Then each owned
+    /// Every task of the process is aborted and dropped before this returns, so none of them runs
+    /// again (unlike [Handle::abort], which aborts descendants once the aborted task is next
+    /// polled) and their blobs, listeners, and connections are released: a restarted process can
+    /// reopen its blobs and rebind its addresses immediately. (A task crashed from within its own
+    /// storage operation is dropped once it is next polled.) Then each owned
     /// partition's unsynchronized writes are resolved as a crash would resolve them (per the
     /// storage fault configuration and policy), and blobs opened before the crash stop publishing.
-    /// The crashed tasks release their blobs once they are next polled, so a restarted process
-    /// reopens them only after awaiting the crashed tasks' handles (or otherwise yielding until
-    /// they are dropped).
     ///
     /// Does nothing if the process already crashed (see [Self::crashed]).
     pub fn crash(self) {
@@ -2070,6 +2104,15 @@ impl ProcessClock {
 }
 
 impl ProcessState {
+    /// Whether this process is `ancestor` or was started from its context.
+    fn within(&self, ancestor: &Self) -> bool {
+        std::ptr::eq(self, ancestor)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.within(ancestor))
+    }
+
     /// Whether this process or any process it was started from is paused.
     fn paused(&self) -> bool {
         self.paused.load(AtomicOrdering::Relaxed)
@@ -5028,6 +5071,45 @@ mod tests {
             assert!(node.current() >= deadline);
             assert_eq!(ctx.current(), runtime + Duration::from_secs(3));
         });
+    }
+
+    #[test]
+    fn test_process_crash_releases_resources_immediately() {
+        use crate::Network as _;
+        // Under every batch order and with the crashed tasks held back by the scheduler, a
+        // restarted process can reopen its blobs and rebind its address right after a crash.
+        for seed in 0..16 {
+            let hold = Pausing::new(
+                RandomWalk::new(seed),
+                seed,
+                probability!(0.5),
+                Duration::from_millis(50),
+            );
+            let cfg = deterministic::Config::new()
+                .with_seed(seed)
+                .with_scheduling_policy(hold);
+            deterministic::Runner::new(cfg).start(|ctx| async move {
+                let address = SocketAddr::from(([127, 0, 0, 1], 4100));
+                for _ in 0..3 {
+                    let (node, process) = ctx.process("node", |partition| partition == "node");
+                    let (opened, ready) = oneshot::channel();
+                    node.child("worker").spawn(move |ctx| async move {
+                        let (blob, _) = ctx.open("node", b"blob").await.unwrap();
+                        let _listener = ctx.bind(address).await.unwrap();
+                        blob.write_at(0, b"data".to_vec(), WriteOptions::SYNC)
+                            .await
+                            .unwrap();
+                        let _ = opened.send(());
+                        futures::future::pending::<()>().await;
+                    });
+                    ready.await.unwrap();
+                    process.crash();
+                }
+                let (_, len) = ctx.open("node", b"blob").await.unwrap();
+                assert_eq!(len, 4);
+                ctx.bind(address).await.unwrap();
+            });
+        }
     }
 
     #[test]
