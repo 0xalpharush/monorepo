@@ -98,6 +98,8 @@ pub mod chain;
 pub(crate) mod compact;
 #[cfg(test)]
 mod conformance;
+#[cfg(test)]
+mod crash_campaign;
 pub mod current;
 pub mod floor;
 pub mod immutable;
