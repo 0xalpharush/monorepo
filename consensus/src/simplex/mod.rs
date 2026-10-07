@@ -7928,9 +7928,7 @@ mod tests {
             partition: validator.to_string(),
             mailbox_size: NZUsize!(1024),
             epoch: Epoch::new(333),
-            floor: config::Floor::Genesis(mocks::application::genesis::<Sha256>(Epoch::new(
-                333,
-            ))),
+            floor: config::Floor::Genesis(mocks::application::genesis::<Sha256>(Epoch::new(333))),
             leader_timeout: Duration::from_secs(1),
             certification_timeout: Duration::from_secs(2),
             timeout_retry: Duration::from_secs(10),
@@ -8107,7 +8105,12 @@ mod tests {
                 .max()
                 .flatten()
                 .unwrap_or(View::zero());
-            await_view(&context, &mut reporters, healed.saturating_add(ViewDelta::new(20))).await;
+            await_view(
+                &context,
+                &mut reporters,
+                healed.saturating_add(ViewDelta::new(20)),
+            )
+            .await;
 
             // Safety: finalizations agree across validators, and only the wiped validator can
             // be faulty
@@ -8123,7 +8126,10 @@ mod tests {
                     );
                 }
                 for faulty in reporter.faults.lock().keys() {
-                    assert_eq!(faulty, &participants[0], "only the wiped validator may be faulty");
+                    assert_eq!(
+                        faulty, &participants[0],
+                        "only the wiped validator may be faulty"
+                    );
                 }
             }
             let wiped_faults = reporters
@@ -8142,7 +8148,9 @@ mod tests {
 
     #[test_traced("WARN")]
     fn test_swizzle_zone_wipe() {
-        let run = |seed| swizzle_zone_wipe::<_, _, RoundRobin>(seed, RoundRobin::default(), ed25519::fixture);
+        let run = |seed| {
+            swizzle_zone_wipe::<_, _, RoundRobin>(seed, RoundRobin::default(), ed25519::fixture)
+        };
         let (state, _) = run(0);
         assert_eq!(state, run(0).0, "runs are deterministic");
         run(1);

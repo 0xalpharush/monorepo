@@ -78,8 +78,9 @@ pub use crate::{
         Policy as NetworkPolicy, Transmission as NetworkTransmission,
     },
     storage::faulty::{
-        Config as FaultConfig, Decision as FaultDecision, Draw as FaultDraw,
-        MetadataConfig, Op as StorageOp, PartialWriteMode, Policy as FaultPolicy, ResizeConfig, SharedRng, WriteConfig,
+        Config as FaultConfig, Decision as FaultDecision, Draw as FaultDraw, MetadataConfig,
+        Op as StorageOp, PartialWriteMode, Policy as FaultPolicy, ResizeConfig, SharedRng,
+        WriteConfig,
     },
 };
 use commonware_codec::Encode;
@@ -2326,7 +2327,12 @@ impl Timer for ExecutorTimer {
     }
 
     fn now(&self) -> SystemTime {
-        *self.0.upgrade().expect("executor already dropped").time.lock()
+        *self
+            .0
+            .upgrade()
+            .expect("executor already dropped")
+            .time
+            .lock()
     }
 }
 
@@ -2597,7 +2603,10 @@ impl crate::Storage for Context {
     async fn remove(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
         let audited = self.storage.inner();
         // A crash before the namespace lock is taken interrupts the removal.
-        if audited.inner().interrupt(partition, name, StorageOp::Remove) {
+        if audited
+            .inner()
+            .interrupt(partition, name, StorageOp::Remove)
+        {
             return futures::future::pending().await;
         }
         let retired = self.opens.remove(
@@ -4501,7 +4510,11 @@ mod tests {
         });
         assert!(task.await.is_err(), "the interrupted task completed");
         assert!(process.crashed());
-        assert_eq!(reached.load(Ordering::SeqCst), 0, "the interrupted call returned");
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            0,
+            "the interrupted call returned"
+        );
     }
 
     #[test]
@@ -4523,7 +4536,11 @@ mod tests {
             vec![
                 (StorageOp::Open, Some(b"a".to_vec()), FaultDraw::Crash),
                 (StorageOp::Remove, Some(b"a".to_vec()), FaultDraw::Crash),
-                (StorageOp::Remove, Some(b"a".to_vec()), FaultDraw::RetainRemove),
+                (
+                    StorageOp::Remove,
+                    Some(b"a".to_vec()),
+                    FaultDraw::RetainRemove
+                ),
             ]
         );
 
@@ -4638,7 +4655,11 @@ mod tests {
         // The partition itself is decided only once every blob is removed.
         assert_eq!(
             retained,
-            vec![Some(b"a".to_vec()), Some(b"b".to_vec()), Some(b"c".to_vec())]
+            vec![
+                Some(b"a".to_vec()),
+                Some(b"b".to_vec()),
+                Some(b"c".to_vec())
+            ]
         );
 
         // Every blob's removal survives, but the partition's does not.
@@ -4742,12 +4763,11 @@ mod tests {
         });
         assert!(policy.namespace_draws().is_empty());
         // The write's crash decision shows the policy was consulted.
-        assert!(
-            policy
-                .seen
-                .lock()
-                .contains(&(StorageOp::Write, Some(b"a".to_vec()), FaultDraw::Crash))
-        );
+        assert!(policy.seen.lock().contains(&(
+            StorageOp::Write,
+            Some(b"a".to_vec()),
+            FaultDraw::Crash
+        )));
     }
 
     #[test]
