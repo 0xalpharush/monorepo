@@ -4922,6 +4922,51 @@ mod tests {
         });
     }
 
+    /// A crash from within one storage operation must stop every other operation of the crashed
+    /// process, including one already waiting out its storage latency in the same task: none may
+    /// complete (or fail) afterwards, since the process no longer runs.
+    #[test]
+    fn test_crash_in_storage_stops_sibling_operation_waiting_out_latency() {
+        // Crash decisions: the two writes (0, 1), then the first sync crashes (2).
+        let policy = CrashAt::new(2, 0);
+        let cfg = deterministic::Config::default()
+            .with_storage_fault_config(
+                FaultConfig::default()
+                    .crash(probability!(0.5))
+                    .latency(Duration::from_millis(10)..Duration::from_millis(10)),
+            )
+            .with_storage_fault_policy(policy);
+        deterministic::Runner::new(cfg).start(|ctx| async move {
+            let (node, process) = ctx.process("node", |partition| partition == "node");
+            let outcome = Arc::new(Mutex::new(None));
+            let observed = outcome.clone();
+            let writer = node.spawn(move |ctx| async move {
+                let (a, _) = ctx.open("node", b"a").await.unwrap();
+                let (b, _) = ctx.open("node", b"b").await.unwrap();
+                a.write_at(0, b"a".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+                b.write_at(0, b"b".to_vec(), WriteOptions::default())
+                    .await
+                    .unwrap();
+                // As a journal syncs several sections at once, recording whichever completes.
+                let record = |name: &'static str, result: Result<(), Error>| {
+                    *observed.lock() = Some((name, result.map_err(|err| err.to_string())));
+                };
+                futures::join!(async { record("a", a.sync().await) }, async {
+                    record("b", b.sync().await)
+                },);
+            });
+            assert!(writer.await.is_err(), "the crashed writer completed");
+            assert!(process.crashed());
+            assert_eq!(
+                *outcome.lock(),
+                None,
+                "an operation of the crashed process completed"
+            );
+        });
+    }
+
     /// Picks the earliest offset for misdirected reads and a fixed latency, recording latencies.
     #[derive(Default)]
     struct MisdirectFirst {
