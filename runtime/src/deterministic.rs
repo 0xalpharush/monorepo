@@ -78,8 +78,8 @@ pub use crate::{
         Policy as NetworkPolicy, Transmission as NetworkTransmission,
     },
     storage::faulty::{
-        Config as FaultConfig, Decision as FaultDecision, Draw as FaultDraw, Op as StorageOp,
-        PartialWriteMode, Policy as FaultPolicy, ResizeConfig, SharedRng, WriteConfig,
+        Config as FaultConfig, Decision as FaultDecision, Draw as FaultDraw,
+        MetadataConfig, Op as StorageOp, PartialWriteMode, Policy as FaultPolicy, ResizeConfig, SharedRng, WriteConfig,
     },
 };
 use commonware_codec::Encode;
@@ -1696,6 +1696,8 @@ impl Context {
     /// from a new process) while the rest of the simulation continues. With
     /// [FaultConfig::crash], a write or sync of an owned partition can also crash the process
     /// from within that operation (the latest started live process owning a partition crashes).
+    /// With [FaultConfig::metadata], so can an open or remove, leaving its namespace change to
+    /// the crash.
     pub fn process(
         &self,
         label: &'static str,
@@ -1922,7 +1924,7 @@ impl Process {
     }
 
     /// Whether the process has crashed, either through [Self::crash] or from within one of its
-    /// storage operations (see [FaultConfig::crash]).
+    /// storage operations (see [FaultConfig::crash] and [FaultConfig::metadata]).
     pub fn crashed(&self) -> bool {
         self.host.crashed.load(AtomicOrdering::Relaxed)
     }
@@ -2572,6 +2574,15 @@ impl crate::Storage for Context {
         name: &[u8],
         versions: std::ops::RangeInclusive<BlobVersion>,
     ) -> Result<(Self::Blob, u64, BlobVersion), Error> {
+        // A crash before the namespace lock is taken interrupts the open (and any creation).
+        if self
+            .storage
+            .inner()
+            .inner()
+            .interrupt(partition, Some(name), StorageOp::Open)
+        {
+            return futures::future::pending().await;
+        }
         let opened = self.opens.open(
             partition,
             name,
@@ -2585,6 +2596,10 @@ impl crate::Storage for Context {
 
     async fn remove(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
         let audited = self.storage.inner();
+        // A crash before the namespace lock is taken interrupts the removal.
+        if audited.inner().interrupt(partition, name, StorageOp::Remove) {
+            return futures::future::pending().await;
+        }
         let retired = self.opens.remove(
             partition,
             name,
@@ -4391,6 +4406,384 @@ mod tests {
             *policy.crashes.lock(),
             0,
             "drew a crash for an unowned partition"
+        );
+    }
+
+    /// One fault decision a [Scripted] policy saw: its operation, name, and draw.
+    type Seen = (StorageOp, Option<Vec<u8>>, FaultDraw);
+
+    /// Decides each fault with `decide` and records every decision.
+    struct Scripted {
+        decide: Box<dyn Fn(&FaultDecision<'_>) -> bool + Send + Sync>,
+        seen: Mutex<Vec<Seen>>,
+    }
+
+    impl Scripted {
+        fn new(decide: impl Fn(&FaultDecision<'_>) -> bool + Send + Sync + 'static) -> Arc<Self> {
+            Arc::new(Self {
+                decide: Box::new(decide),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// The recorded decisions that only namespace faults make.
+        fn namespace_draws(&self) -> Vec<Seen> {
+            self.seen
+                .lock()
+                .iter()
+                .filter(|(op, _, draw)| {
+                    matches!(draw, FaultDraw::RetainCreate | FaultDraw::RetainRemove)
+                        || (*draw == FaultDraw::Crash
+                            && matches!(op, StorageOp::Open | StorageOp::Remove))
+                })
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl FaultPolicy for Scripted {
+        fn occurs(&self, decision: &FaultDecision<'_>, _: commonware_utils::Probability) -> bool {
+            self.seen.lock().push((
+                decision.op,
+                decision.name.map(<[u8]>::to_vec),
+                decision.draw,
+            ));
+            (self.decide)(decision)
+        }
+
+        fn between(&self, _: &FaultDecision<'_>, range: std::ops::Range<u64>) -> u64 {
+            range.start
+        }
+    }
+
+    fn metadata_config(policy: Arc<Scripted>) -> deterministic::Config {
+        deterministic::Config::default()
+            .with_storage_fault_config(FaultConfig::default().metadata(MetadataConfig {
+                crash_rate: probability!(0.5),
+                retention_rate: probability!(0.5),
+            }))
+            .with_storage_fault_policy(policy)
+    }
+
+    /// Crash in the `op` of `name` (`None` for a partition removal) and decide each retention
+    /// draw with `retain`.
+    fn crash_in(
+        op: StorageOp,
+        name: Option<&'static [u8]>,
+        retain: impl Fn(Option<&[u8]>) -> bool + Send + Sync + 'static,
+    ) -> Arc<Scripted> {
+        Scripted::new(move |decision| match decision.draw {
+            FaultDraw::Crash => decision.op == op && decision.name == name,
+            FaultDraw::RetainCreate | FaultDraw::RetainRemove => retain(decision.name),
+            _ => false,
+        })
+    }
+
+    /// In a process owning partition `node`, create synced blobs `names`, then run `last`, which
+    /// the policy is expected to crash.
+    async fn run_until_crash<F, Fut>(ctx: &Context, names: &'static [&'static [u8]], last: F)
+    where
+        F: FnOnce(Context) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (node, process) = ctx.process("node", |partition| partition == "node");
+        let reached = Arc::new(AtomicUsize::new(0));
+        let after = reached.clone();
+        let task = node.child("task").spawn(move |ctx| async move {
+            for name in names {
+                let (blob, _) = ctx.open("node", name).await.unwrap();
+                blob.write_at(0, name.to_vec(), WriteOptions::SYNC)
+                    .await
+                    .unwrap();
+            }
+            last(ctx).await;
+            after.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(task.await.is_err(), "the interrupted task completed");
+        assert!(process.crashed());
+        assert_eq!(reached.load(Ordering::SeqCst), 0, "the interrupted call returned");
+    }
+
+    #[test]
+    fn test_crash_in_remove_can_restore_the_blob() {
+        let policy = crash_in(StorageOp::Remove, Some(b"a"), |_| false);
+        let (_, checkpoint) = deterministic::Runner::new(metadata_config(policy.clone()))
+            .start_and_recover(|ctx| async move {
+                run_until_crash(&ctx, &[b"a"], |ctx| async move {
+                    let _ = ctx.remove("node", Some(b"a")).await;
+                })
+                .await;
+
+                // The removal never became durable: the blob reappears with its durable contents.
+                assert_eq!(ctx.scan("node").await.unwrap(), vec![b"a".to_vec()]);
+                assert_eq!(read_all(&ctx, "node", b"a").await, b"a");
+            });
+        assert_eq!(
+            policy.namespace_draws(),
+            vec![
+                (StorageOp::Open, Some(b"a".to_vec()), FaultDraw::Crash),
+                (StorageOp::Remove, Some(b"a".to_vec()), FaultDraw::Crash),
+                (StorageOp::Remove, Some(b"a".to_vec()), FaultDraw::RetainRemove),
+            ]
+        );
+
+        // The outcome is durable across a whole-runtime crash.
+        deterministic::Runner::from(checkpoint).start(|ctx| async move {
+            assert_eq!(read_all(&ctx, "node", b"a").await, b"a");
+        });
+    }
+
+    #[test]
+    fn test_crash_in_remove_can_keep_the_removal() {
+        let policy = crash_in(StorageOp::Remove, Some(b"a"), |_| true);
+        deterministic::Runner::new(metadata_config(policy)).start(|ctx| async move {
+            run_until_crash(&ctx, &[b"a", b"b"], |ctx| async move {
+                let _ = ctx.remove("node", Some(b"a")).await;
+            })
+            .await;
+            assert_eq!(ctx.scan("node").await.unwrap(), vec![b"b".to_vec()]);
+        });
+    }
+
+    #[test]
+    fn test_crash_in_open_can_drop_the_created_blob() {
+        // The partition did not exist: it vanishes with the blob.
+        let policy = crash_in(StorageOp::Open, Some(b"new"), |_| false);
+        deterministic::Runner::new(metadata_config(policy)).start(|ctx| async move {
+            run_until_crash(&ctx, &[], |ctx| async move {
+                let _ = ctx.open("node", b"new").await;
+            })
+            .await;
+            assert!(matches!(
+                ctx.scan("node").await,
+                Err(Error::PartitionMissing(_))
+            ));
+        });
+
+        // The partition existed: it keeps its other blobs.
+        let policy = crash_in(StorageOp::Open, Some(b"new"), |_| false);
+        deterministic::Runner::new(metadata_config(policy)).start(|ctx| async move {
+            run_until_crash(&ctx, &[b"a"], |ctx| async move {
+                let _ = ctx.open("node", b"new").await;
+            })
+            .await;
+            assert_eq!(ctx.scan("node").await.unwrap(), vec![b"a".to_vec()]);
+        });
+    }
+
+    #[test]
+    fn test_crash_in_open_can_keep_an_empty_created_blob() {
+        let policy = crash_in(StorageOp::Open, Some(b"new"), |_| true);
+        deterministic::Runner::new(metadata_config(policy)).start(|ctx| async move {
+            run_until_crash(&ctx, &[b"a"], |ctx| async move {
+                let _ = ctx.open("node", b"new").await;
+            })
+            .await;
+            assert_eq!(
+                ctx.scan("node").await.unwrap(),
+                vec![b"a".to_vec(), b"new".to_vec()]
+            );
+
+            // Only the name survived: the next open initializes an empty blob.
+            let (_, len) = ctx.open("node", b"new").await.unwrap();
+            assert_eq!(len, 0);
+        });
+    }
+
+    #[test]
+    fn test_crash_in_open_of_existing_blob_changes_nothing() {
+        let policy = crash_in(StorageOp::Open, Some(b"a"), |_| true);
+        deterministic::Runner::new(metadata_config(policy.clone())).start(|ctx| async move {
+            let (blob, _) = ctx.open("node", b"a").await.unwrap();
+            blob.write_at(0, b"data".to_vec(), WriteOptions::SYNC)
+                .await
+                .unwrap();
+            drop(blob);
+            run_until_crash(&ctx, &[], |ctx| async move {
+                let _ = ctx.open("node", b"a").await;
+            })
+            .await;
+            assert_eq!(read_all(&ctx, "node", b"a").await, b"data");
+        });
+        assert!(
+            !policy
+                .namespace_draws()
+                .iter()
+                .any(|(_, _, draw)| *draw == FaultDraw::RetainCreate),
+            "drew a retention for an existing blob"
+        );
+    }
+
+    #[test]
+    fn test_crash_in_partition_removal_keeps_a_subset() {
+        // Only the removal of `b` survives.
+        let policy = crash_in(StorageOp::Remove, None, |name| name == Some(b"b"));
+        deterministic::Runner::new(metadata_config(policy.clone())).start(|ctx| async move {
+            run_until_crash(&ctx, &[b"a", b"b", b"c"], |ctx| async move {
+                let _ = ctx.remove("node", None).await;
+            })
+            .await;
+            assert_eq!(
+                ctx.scan("node").await.unwrap(),
+                vec![b"a".to_vec(), b"c".to_vec()]
+            );
+            assert_eq!(read_all(&ctx, "node", b"c").await, b"c");
+        });
+        let retained: Vec<_> = policy
+            .namespace_draws()
+            .into_iter()
+            .filter(|(_, _, draw)| *draw == FaultDraw::RetainRemove)
+            .map(|(_, name, _)| name)
+            .collect();
+        // The partition itself is decided only once every blob is removed.
+        assert_eq!(
+            retained,
+            vec![Some(b"a".to_vec()), Some(b"b".to_vec()), Some(b"c".to_vec())]
+        );
+
+        // Every blob's removal survives, but the partition's does not.
+        let policy = crash_in(StorageOp::Remove, None, |name| name.is_some());
+        deterministic::Runner::new(metadata_config(policy)).start(|ctx| async move {
+            run_until_crash(&ctx, &[b"a", b"b"], |ctx| async move {
+                let _ = ctx.remove("node", None).await;
+            })
+            .await;
+            assert!(ctx.scan("node").await.unwrap().is_empty());
+        });
+
+        // The whole removal survives.
+        let policy = crash_in(StorageOp::Remove, None, |_| true);
+        deterministic::Runner::new(metadata_config(policy)).start(|ctx| async move {
+            run_until_crash(&ctx, &[b"a", b"b"], |ctx| async move {
+                let _ = ctx.remove("node", None).await;
+            })
+            .await;
+            assert!(matches!(
+                ctx.scan("node").await,
+                Err(Error::PartitionMissing(_))
+            ));
+        });
+    }
+
+    #[test]
+    fn test_completed_namespace_changes_survive_every_crash() {
+        // Namespace faults are enabled, but the policy never interrupts a call.
+        let policy = Scripted::new(|decision| {
+            matches!(
+                decision.draw,
+                FaultDraw::RetainCreate | FaultDraw::RetainRemove
+            )
+        });
+        let (_, checkpoint) = deterministic::Runner::new(metadata_config(policy.clone()))
+            .start_and_recover(|ctx| async move {
+                let (node, process) = ctx.process("node", |partition| partition == "node");
+                node.child("task")
+                    .spawn(|ctx| async move {
+                        for name in [b"a", b"b", b"c"] {
+                            let (blob, _) = ctx.open("node", name).await.unwrap();
+                            blob.write_at(0, name.to_vec(), WriteOptions::SYNC)
+                                .await
+                                .unwrap();
+                        }
+                        // Created but never synced.
+                        ctx.open("node", b"empty").await.unwrap();
+                        ctx.remove("node", Some(b"b")).await.unwrap();
+                        ctx.open("gone", b"x").await.unwrap();
+                        ctx.remove("gone", None).await.unwrap();
+                    })
+                    .await
+                    .unwrap();
+                process.crash();
+                assert_eq!(
+                    ctx.scan("node").await.unwrap(),
+                    vec![b"a".to_vec(), b"c".to_vec(), b"empty".to_vec()]
+                );
+            });
+        deterministic::Runner::from(checkpoint).start(|ctx| async move {
+            assert_eq!(
+                ctx.scan("node").await.unwrap(),
+                vec![b"a".to_vec(), b"c".to_vec(), b"empty".to_vec()]
+            );
+            assert!(matches!(
+                ctx.scan("gone").await,
+                Err(Error::PartitionMissing(_))
+            ));
+        });
+        assert!(
+            !policy
+                .namespace_draws()
+                .iter()
+                .any(|(_, _, draw)| *draw != FaultDraw::Crash),
+            "a completed namespace change drew a retention"
+        );
+    }
+
+    #[test]
+    fn test_namespace_faults_disabled_make_no_draws() {
+        let policy = Scripted::new(|_| false);
+        let cfg = deterministic::Config::default()
+            .with_storage_fault_config(FaultConfig::default().crash(probability!(0.5)))
+            .with_storage_fault_policy(policy.clone());
+        deterministic::Runner::new(cfg).start(|ctx| async move {
+            let (node, process) = ctx.process("node", |partition| partition == "node");
+            node.spawn(|ctx| async move {
+                let (blob, _) = ctx.open("node", b"a").await.unwrap();
+                blob.write_at(0, b"a".to_vec(), WriteOptions::SYNC)
+                    .await
+                    .unwrap();
+                drop(blob);
+                ctx.remove("node", Some(b"a")).await.unwrap();
+                ctx.open("node", b"b").await.unwrap();
+                ctx.remove("node", None).await.unwrap();
+            })
+            .await
+            .unwrap();
+            process.crash();
+        });
+        assert!(policy.namespace_draws().is_empty());
+        // The write's crash decision shows the policy was consulted.
+        assert!(
+            policy
+                .seen
+                .lock()
+                .contains(&(StorageOp::Write, Some(b"a".to_vec()), FaultDraw::Crash))
+        );
+    }
+
+    #[test]
+    fn test_namespace_faults_are_deterministic() {
+        fn run(seed: u64) -> (Vec<Vec<u8>>, String) {
+            let cfg = deterministic::Config::default()
+                .with_seed(seed)
+                .with_storage_fault_config(FaultConfig::default().metadata(MetadataConfig {
+                    crash_rate: probability!(0.1),
+                    retention_rate: probability!(0.5),
+                }));
+            deterministic::Runner::new(cfg).start(|ctx| async move {
+                let (node, _process) = ctx.process("node", |partition| partition == "node");
+                let _ = node
+                    .spawn(|ctx| async move {
+                        for i in 0u8..32 {
+                            let (blob, _) = ctx.open("node", &[i]).await.unwrap();
+                            blob.write_at(0, vec![i], WriteOptions::SYNC).await.unwrap();
+                            drop(blob);
+                            if i % 2 == 1 {
+                                ctx.remove("node", Some(&[i - 1])).await.unwrap();
+                            }
+                        }
+                    })
+                    .await;
+                let names = ctx.scan("node").await.unwrap_or_default();
+                (names, ctx.auditor().state())
+            })
+        }
+        let outcomes: Vec<_> = (0..8).map(run).collect();
+        for (seed, outcome) in outcomes.iter().enumerate() {
+            assert_eq!(*outcome, run(seed as u64));
+        }
+        assert!(
+            outcomes.windows(2).any(|pair| pair[0].0 != pair[1].0),
+            "seeds never changed the outcome"
         );
     }
 

@@ -10242,4 +10242,169 @@ mod tests {
             assert!(matches!(result, Err(Error::Corruption(_))));
         });
     }
+
+    /// Crashes the `crash_at`-th namespace crash decision, deciding each retention with `retain`.
+    struct NamespaceCrash {
+        crash_at: usize,
+        retain: fn(usize) -> bool,
+        crashes: std::sync::Mutex<usize>,
+        retentions: std::sync::Mutex<usize>,
+    }
+
+    impl deterministic::FaultPolicy for NamespaceCrash {
+        fn occurs(
+            &self,
+            decision: &deterministic::FaultDecision<'_>,
+            _: commonware_utils::Probability,
+        ) -> bool {
+            match decision.draw {
+                deterministic::FaultDraw::Crash => {
+                    let mut crashes = self.crashes.lock().unwrap();
+                    let crash = *crashes == self.crash_at;
+                    *crashes += 1;
+                    crash
+                }
+                deterministic::FaultDraw::RetainCreate | deterministic::FaultDraw::RetainRemove => {
+                    let mut retentions = self.retentions.lock().unwrap();
+                    *retentions += 1;
+                    (self.retain)(*retentions - 1)
+                }
+                _ => false,
+            }
+        }
+
+        fn between(
+            &self,
+            _: &deterministic::FaultDecision<'_>,
+            range: std::ops::Range<u64>,
+        ) -> u64 {
+            range.start
+        }
+    }
+
+    /// Progress acknowledged by the crashed workload.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Acked {
+        end: u64,
+        reset_started: bool,
+        reset_done: bool,
+    }
+
+    /// Crash inside each open and remove of a prune and reset workload, keeping or losing each
+    /// interrupted namespace change, and check that recovery keeps every acknowledged item.
+    #[test]
+    fn test_crash_in_namespace_change_recovers() {
+        const RESET: u64 = 30;
+        let retains: [fn(usize) -> bool; 4] = [
+            |_| false,
+            |_| true,
+            |index| index % 2 == 0,
+            |index| index % 2 == 1,
+        ];
+        for retain in retains {
+            for crash_at in 0.. {
+                let policy = Arc::new(NamespaceCrash {
+                    crash_at,
+                    retain,
+                    crashes: Default::default(),
+                    retentions: Default::default(),
+                });
+                let cfg = deterministic::Config::default()
+                    .with_storage_fault_config(deterministic::FaultConfig::default().metadata(
+                        deterministic::MetadataConfig {
+                            crash_rate: probability!(0.5),
+                            retention_rate: probability!(0.5),
+                        },
+                    ))
+                    .with_storage_fault_policy(policy);
+                let completed = deterministic::Runner::new(cfg).start(|context| async move {
+                    let cfg = initialization_cfg(&context, "ns-crash", 3);
+                    let acked = Arc::new(std::sync::Mutex::new(Acked::default()));
+                    let (node, process) =
+                        context.process("node", |partition| partition.starts_with("ns-crash"));
+                    let progress = acked.clone();
+                    let workload_cfg = cfg.clone();
+                    let completed = node
+                        .child("workload")
+                        .spawn(move |context| async move {
+                            let cfg = workload_cfg;
+                            let ack = |end| progress.lock().unwrap().end = end;
+                            let mut journal =
+                                Journal::<_, u64>::init(context.child("first"), cfg.clone())
+                                    .await
+                                    .unwrap();
+                            for round in 0..4u64 {
+                                for _ in 0..4 {
+                                    let position = journal.size();
+                                    (journal, _) = journal.append(&position).await.unwrap();
+                                }
+                                journal = journal.sync().await.unwrap();
+                                ack(journal.size());
+                                (journal, _) = journal.prune(round * 3).await.unwrap();
+                            }
+                            drop(journal);
+                            progress.lock().unwrap().reset_started = true;
+                            let mut journal = Journal::<_, u64>::init_at_size(
+                                context.child("reset"),
+                                cfg.clone(),
+                                RESET,
+                            )
+                            .await
+                            .unwrap();
+                            {
+                                let mut progress = progress.lock().unwrap();
+                                progress.reset_done = true;
+                                progress.end = RESET;
+                            }
+                            for _ in 0..4 {
+                                let position = journal.size();
+                                (journal, _) = journal.append(&position).await.unwrap();
+                            }
+                            journal = journal.sync().await.unwrap();
+                            ack(journal.size());
+                        })
+                        .await
+                        .is_ok();
+
+                    // Release the partitions so recovery cannot be interrupted.
+                    process.crash();
+                    // Recover and check the acknowledged prefix.
+                    let acked = *acked.lock().unwrap();
+                    let cfg = initialization_cfg(&context, "ns-crash", 3);
+                    let journal = Journal::<_, u64>::init(context.child("recovered"), cfg)
+                        .await
+                        .unwrap_or_else(|err| {
+                            panic!("crash_at={crash_at} acked={acked:?}: recovery failed: {err}")
+                        });
+                    let bounds = journal.bounds();
+                    let reset = bounds.start >= RESET;
+                    assert!(
+                        !reset || acked.reset_started,
+                        "crash_at={crash_at} acked={acked:?}: reset before it started: {bounds:?}"
+                    );
+                    assert!(
+                        reset || !acked.reset_done,
+                        "crash_at={crash_at} acked={acked:?}: lost a completed reset: {bounds:?}"
+                    );
+                    if !reset || acked.reset_done {
+                        assert!(
+                            bounds.end >= acked.end,
+                            "crash_at={crash_at} acked={acked:?}: lost acked items: {bounds:?}"
+                        );
+                    }
+                    for position in bounds.clone() {
+                        assert_eq!(
+                            journal.read(position).await.unwrap(),
+                            position,
+                            "crash_at={crash_at} acked={acked:?} bounds={bounds:?}"
+                        );
+                    }
+                    completed
+                });
+                if completed {
+                    break;
+                }
+            }
+        }
+    }
 }
