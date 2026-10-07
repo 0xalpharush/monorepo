@@ -256,6 +256,17 @@ impl<
         let (journal, unverified_heights) = self.replay(journal).await;
         self.journal = Some(journal);
 
+        // A crash can journal certificates without the tip they advance (the tip is synced in
+        // its own section), so advance over contiguous certified heights as a live certificate
+        // would.
+        let mut new_tip = self.tip;
+        while self.confirmed.contains_key(&new_tip) && new_tip.get() < u64::MAX {
+            new_tip = new_tip.next();
+        }
+        if new_tip > self.tip {
+            self = self.fast_forward_tip(new_tip).await;
+        }
+
         // Request digests for unverified heights
         for height in unverified_heights {
             trace!(%height, "requesting digest for unverified height from replay");
