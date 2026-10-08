@@ -112,6 +112,9 @@ pub trait Producer: Clone + Send + 'static {
 }
 
 #[cfg(test)]
+mod sockets_restart;
+
+#[cfg(test)]
 mod tests {
     use super::{
         Config, Engine, Mailbox,
