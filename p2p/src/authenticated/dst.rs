@@ -88,9 +88,18 @@ pub(crate) struct Cluster<V: Variant> {
 
 impl<V: Variant> Cluster<V> {
     fn new(context: deterministic::Context, n: usize, bootstrappers: usize) -> Self {
+        let mut cluster = Self::stopped(context, n, bootstrappers);
+        for i in 0..n {
+            cluster.start(i);
+        }
+        cluster
+    }
+
+    /// A cluster of `n` peers, none of them started.
+    fn stopped(context: deterministic::Context, n: usize, bootstrappers: usize) -> Self {
         let signers = (0..n as u64).map(ed25519::PrivateKey::from_seed).collect();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-        let mut cluster = Self {
+        Self {
             context,
             signers,
             peers: (0..n).map(|_| None).collect(),
@@ -100,11 +109,7 @@ impl<V: Variant> Cluster<V> {
             bootstrappers,
             sets: vec![(0, (0..n).collect())],
             _variant: PhantomData,
-        };
-        for i in 0..n {
-            cluster.start(i);
         }
-        cluster
     }
 
     fn n(&self) -> usize {
@@ -547,4 +552,88 @@ pub(crate) fn connect_simultaneously<V: Variant>(seed: u64, n: usize, latency: D
         let mut cluster = Cluster::<V>::new(context.child("cluster"), n, n);
         cluster.await_connected(deadline).await;
     });
+}
+
+/// How long `n` peers that start at uniformly random times within `spread` (all at once if
+/// zero) over links of one-way `latency` take, from the last start, until every peer can send
+/// to every other, or `None` if they are not connected by `deadline`.
+pub(crate) fn time_to_connect<V: Variant>(
+    seed: u64,
+    n: usize,
+    latency: Duration,
+    spread: Duration,
+    deadline: Duration,
+) -> Option<Duration> {
+    let testbed = Testbed::new(
+        Topology::sockets(seed).with_default(LinkConfig::new(latency, Duration::ZERO)),
+    );
+    let cfg = testbed.install(
+        deterministic::Config::default()
+            .with_seed(seed)
+            .with_timeout(Some(deadline * 2 + Duration::from_secs(60))),
+    );
+    deterministic::Runner::new(cfg).start(|mut context| async move {
+        let mut cluster = Cluster::<V>::stopped(context.child("cluster"), n, n);
+        let start = context.current();
+        let mut offsets: Vec<(Duration, usize)> = (0..n)
+            .map(|i| {
+                let offset = if spread.is_zero() {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(context.random_range(0..spread.as_millis() as u64))
+                };
+                (offset, i)
+            })
+            .collect();
+        offsets.sort();
+        for (offset, i) in offsets {
+            context.sleep_until(start + offset).await;
+            cluster.start(i);
+        }
+        let started = context.current();
+        let keys = cluster.keys();
+        loop {
+            let mut connected = true;
+            for i in 0..n {
+                let sender = &mut cluster.peers[i].as_mut().unwrap().sender;
+                let sent = sender.send(Recipients::All, vec![PROBE], false);
+                if (0..n).any(|j| j != i && !sent.contains(&keys[j])) {
+                    connected = false;
+                }
+            }
+            let elapsed = context.current().duration_since(started).unwrap();
+            if connected {
+                return Some(elapsed);
+            }
+            if elapsed >= deadline {
+                return None;
+            }
+            context.sleep(Duration::from_millis(50)).await;
+        }
+    })
+}
+
+/// Summarize [time_to_connect] over `seeds` as `(median, p90, max, unconnected)` (in seconds;
+/// unconnected runs count as `deadline` in the percentiles).
+pub(crate) fn connect_stats<V: Variant>(
+    seeds: std::ops::Range<u64>,
+    n: usize,
+    latency: Duration,
+    spread: Duration,
+    deadline: Duration,
+) -> (f64, f64, f64, usize) {
+    let mut times: Vec<f64> = Vec::new();
+    let mut unconnected = 0;
+    for seed in seeds {
+        match time_to_connect::<V>(seed, n, latency, spread, deadline) {
+            Some(t) => times.push(t.as_secs_f64()),
+            None => {
+                unconnected += 1;
+                times.push(deadline.as_secs_f64());
+            }
+        }
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
+    (at(0.5), at(0.9), *times.last().unwrap(), unconnected)
 }

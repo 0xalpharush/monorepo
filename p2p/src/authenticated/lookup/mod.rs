@@ -3032,6 +3032,95 @@ mod dst {
         }
     }
 
+    /// Lookup with [Config::recommended] (private IPs allowed, as simulated hosts use them).
+    struct LookupRecommended;
+
+    impl Variant for LookupRecommended {
+        type Oracle = Oracle<ed25519::PublicKey>;
+
+        fn start(
+            context: deterministic::Context,
+            signers: &[ed25519::PrivateKey],
+            i: usize,
+            _bootstrappers: usize,
+        ) -> (dst::Sender, dst::Receiver, Self::Oracle) {
+            let n = commonware_utils::NZUsize!(signers.len());
+            let base = sockets::config(signers[i].clone(), i, b"dst", n, 1_024 * 1_024);
+            let mut config = Config::recommended(
+                base.handshake,
+                b"dst",
+                sockets::address(i),
+                n,
+                1_024 * 1_024,
+            );
+            config.allow_private_ips = true;
+            let (mut network, oracle) = Network::new(context, config);
+            let (sender, receiver) = network.register(0, Quota::per_second(NZU32!(1_000)));
+            network.start();
+            (sender, receiver, oracle)
+        }
+
+        fn track(
+            oracle: &mut Self::Oracle,
+            signers: &[ed25519::PrivateKey],
+            index: u64,
+            members: &[usize],
+        ) {
+            Lookup::track(oracle, signers, index, members)
+        }
+    }
+
+    /// Time until `n` peers that start within `DST_SPREAD_MS` (default 0: at the same moment)
+    /// are fully connected with the recommended configuration (and, with `DST_TEST_CONFIG`, the
+    /// test configuration), over a range of one-way latencies. Prints median/p90/max (seconds)
+    /// over `DST_START..DST_END` (default `0..20`); `DST_N` (default `2,10`),
+    /// `DST_LATENCIES_MS` (default `5,25,50,100,150,250`).
+    #[test]
+    #[ignore]
+    fn test_dst_simultaneous_dials_stats() {
+        let list = |name: &str, default: &str| -> Vec<u64> {
+            std::env::var(name)
+                .unwrap_or_else(|_| default.into())
+                .split(',')
+                .map(|v| v.parse().unwrap())
+                .collect()
+        };
+        let seeds = if std::env::var("DST_END").is_err() {
+            0..20
+        } else {
+            dst::env_seeds()
+        };
+        let runs = seeds.end - seeds.start;
+        let spread = Duration::from_millis(list("DST_SPREAD_MS", "0")[0]);
+        for n in list("DST_N", "2,10") {
+            for latency in list("DST_LATENCIES_MS", "5,25,50,100,150,250") {
+                let latency = Duration::from_millis(latency);
+                let (m, p90, max, un) = dst::connect_stats::<LookupRecommended>(
+                    seeds.clone(),
+                    n as usize,
+                    latency,
+                    spread,
+                    Duration::from_secs(600),
+                );
+                eprintln!(
+                    "recommended n={n} latency={latency:?} spread={spread:?}: median={m:.1}s p90={p90:.1}s max={max:.1}s unconnected={un}/{runs}"
+                );
+                if std::env::var("DST_TEST_CONFIG").is_ok() {
+                    let (m, p90, max, un) = dst::connect_stats::<Lookup>(
+                        seeds.clone(),
+                        n as usize,
+                        latency,
+                        spread,
+                        Duration::from_secs(120),
+                    );
+                    eprintln!(
+                        "test        n={n} latency={latency:?} spread={spread:?}: median={m:.1}s p90={p90:.1}s max={max:.1}s unconnected={un}/{runs}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_dst_campaign() {
         dst::sweep::<Lookup>(0..8);
