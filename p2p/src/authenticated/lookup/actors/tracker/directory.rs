@@ -68,6 +68,9 @@ pub struct Directory<E: Rng + Clock + RuntimeMetrics, C: PublicKey> {
     peer_connection_cooldown: Duration,
 
     // ---------- State ----------
+    /// Our own public key.
+    myself: C,
+
     /// The records of all peers.
     peers: HashMap<C, Record>,
 
@@ -92,7 +95,7 @@ impl<E: Spawner + Rng + Clock + RuntimeMetrics, C: PublicKey> Directory<E, C> {
     pub fn init(context: E, myself: C, cfg: Config, releaser: Releaser<C>) -> Self {
         // Create the list of peers and add myself.
         let mut peers = HashMap::new();
-        peers.insert(myself, Record::myself());
+        peers.insert(myself.clone(), Record::myself());
 
         let metrics = Metrics::init(&context);
         let _ = metrics.tracked.try_set(peers.len() - 1); // Exclude self
@@ -105,6 +108,7 @@ impl<E: Spawner + Rng + Clock + RuntimeMetrics, C: PublicKey> Directory<E, C> {
             bypass_ip_check: cfg.bypass_ip_check,
             block_duration: cfg.block_duration,
             peer_connection_cooldown: cfg.peer_connection_cooldown,
+            myself,
             peers,
             peer_sets: BTreeMap::new(),
             blocked: PrioritySet::new(),
@@ -121,7 +125,38 @@ impl<E: Spawner + Rng + Clock + RuntimeMetrics, C: PublicKey> Directory<E, C> {
         let Some(record) = self.peers.get_mut(peer) else {
             return;
         };
-        record.release();
+        if record.release() == Some(true) {
+            // Both peers dialed each other at once and each rejected the other's dial while
+            // holding a reservation for its own. Break the tie by key instead of both waiting out
+            // the cooldown (or, when the handshake outlasts the cooldown, redialing together
+            // forever): the peer with the lower key redials soon (after a short jittered delay,
+            // within per-IP handshake limits), and the other (which accepts that dial, as its own
+            // dial failed) redials only well after that.
+            let cooldown = self.peer_connection_cooldown;
+            let now = self.context.current();
+            let lower = self.myself < *peer;
+            let next_dial_at = if lower {
+                now.saturating_add_ext(cooldown / 8)
+                    .add_jittered(&mut self.context, cooldown / 8)
+            } else {
+                // Leave the lower peer time to complete its redial even when a handshake takes
+                // longer than the cooldown (the failed dial took `attempt`).
+                let attempt = self
+                    .peers
+                    .get(peer)
+                    .map(|record| record.reserved_for(now, cooldown))
+                    .unwrap_or_default();
+                now.saturating_add_ext(cooldown.max(attempt * 3))
+                    .add_jittered(&mut self.context, cooldown / 2)
+            };
+            if let Some(record) = self.peers.get_mut(peer) {
+                if lower {
+                    record.redial_at(now, next_dial_at);
+                } else {
+                    record.delay_dial(next_dial_at);
+                }
+            }
+        }
         self.metrics.connected.remove_by(peer);
         self.metrics.reserved.dec();
         self.delete_if_needed(peer);
@@ -414,7 +449,10 @@ impl<E: Spawner + Rng + Clock + RuntimeMetrics, C: PublicKey> Directory<E, C> {
     ///
     /// Checks eligibility (peer set membership), blocked status, egress IP match (if not bypass_ip_check),
     /// and connection status.
-    pub fn acceptable(&self, peer: &C, source_ip: IpAddr) -> bool {
+    pub fn acceptable(&mut self, peer: &C, source_ip: IpAddr) -> bool {
+        if let Some(record) = self.peers.get_mut(peer) {
+            record.note_inbound();
+        }
         !self.is_blocked(peer)
             && self
                 .peers
@@ -497,8 +535,16 @@ impl<E: Spawner + Rng + Clock + RuntimeMetrics, C: PublicKey> Directory<E, C> {
 
         // Reserve
         let record = self.peers.get_mut(peer).unwrap();
-        match record.reserve(&mut self.context, self.peer_connection_cooldown) {
+        let result = if matches!(metadata, Metadata::Listener(_)) {
+            record.reserve_inbound(&mut self.context, self.peer_connection_cooldown)
+        } else {
+            record.reserve(&mut self.context, self.peer_connection_cooldown)
+        };
+        match result {
             ReserveResult::Reserved => {
+                if matches!(metadata, Metadata::Dialer(_)) {
+                    record.set_dialing();
+                }
                 self.metrics.reserved.inc();
                 Some(Reservation::new(metadata, self.releaser.clone()))
             }

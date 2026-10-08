@@ -62,6 +62,16 @@ pub struct Record {
 
     /// The earliest time we are willing to dial this peer.
     next_dial_at: SystemTime,
+
+    /// If `true`, the current reservation is for our own outbound dial.
+    dialing: bool,
+
+    /// If `true`, the peer dialed us while we held a reservation for our own dial to it.
+    collided: bool,
+
+    /// If `true`, our last dial to the peer failed: accept its dial to us without waiting for
+    /// `next_reservable_at`.
+    accept_inbound: bool,
 }
 
 impl Record {
@@ -78,6 +88,9 @@ impl Record {
             persistent: false,
             next_reservable_at: SystemTime::UNIX_EPOCH,
             next_dial_at: SystemTime::UNIX_EPOCH,
+            dialing: false,
+            collided: false,
+            accept_inbound: false,
         }
     }
 
@@ -92,6 +105,9 @@ impl Record {
             persistent: true,
             next_reservable_at: SystemTime::UNIX_EPOCH,
             next_dial_at: SystemTime::UNIX_EPOCH,
+            dialing: false,
+            collided: false,
+            accept_inbound: false,
         }
     }
 
@@ -155,6 +171,7 @@ impl Record {
         }
         self.status = Status::Reserved;
         self.stale_connection = false;
+        self.accept_inbound = false;
         self.next_reservable_at = now.saturating_add_ext(interval);
         self.next_dial_at = self.next_reservable_at.add_jittered(context, interval / 2);
         ReserveResult::Reserved
@@ -175,10 +192,64 @@ impl Record {
     }
 
     /// Releases any reservation on the peer.
-    pub fn release(&mut self) {
+    ///
+    /// If the reservation was for our own dial to the peer and it never connected, the peer may
+    /// be reserved again (for its dial to us) right away; returns whether the peer dialed us
+    /// while that reservation was held (both dialed each other at once).
+    pub fn release(&mut self) -> Option<bool> {
         assert!(self.status != Status::Inert, "Cannot release an Inert peer");
+        let failed_dial = (self.status == Status::Reserved && self.dialing).then_some(self.collided);
         self.status = Status::Inert;
         self.stale_connection = false;
+        self.dialing = false;
+        self.collided = false;
+        self.accept_inbound = failed_dial.is_some();
+        failed_dial
+    }
+
+    /// Attempt to reserve the peer for its dial to us, as [Self::reserve], without waiting for
+    /// `next_reservable_at` if our last dial to it failed.
+    pub fn reserve_inbound(
+        &mut self,
+        context: &mut (impl Rng + Clock),
+        interval: Duration,
+    ) -> ReserveResult {
+        if self.accept_inbound && matches!(self.status, Status::Inert) {
+            self.next_reservable_at = self.next_reservable_at.min(context.current());
+        }
+        self.reserve(context, interval)
+    }
+
+    /// Marks the current reservation as one for our own outbound dial.
+    pub const fn set_dialing(&mut self) {
+        self.dialing = true;
+    }
+
+    /// Records that the peer dialed us, if we hold a reservation for our own dial to it.
+    pub fn note_inbound(&mut self) {
+        if self.status == Status::Reserved && self.dialing {
+            self.collided = true;
+        }
+    }
+
+    /// How long ago (as of `now`) the last reservation was made, given the `interval` it set.
+    pub fn reserved_for(&self, now: SystemTime, interval: Duration) -> Duration {
+        let reserved_at = self
+            .next_reservable_at
+            .checked_sub(interval)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        now.duration_since(reserved_at).unwrap_or_default()
+    }
+
+    /// Dial the peer no earlier than `next_dial_at`.
+    pub fn delay_dial(&mut self, next_dial_at: SystemTime) {
+        self.next_dial_at = self.next_dial_at.max(next_dial_at);
+    }
+
+    /// Let the peer be reserved again right away and dial it no earlier than `next_dial_at`.
+    pub const fn redial_at(&mut self, now: SystemTime, next_dial_at: SystemTime) {
+        self.next_reservable_at = now;
+        self.next_dial_at = next_dial_at;
     }
 
     // ---------- Getters ----------
@@ -412,7 +483,7 @@ mod tests {
             );
             assert_eq!(record.status, Status::Active);
 
-            record.release();
+            let _ = record.release();
             assert_eq!(record.status, Status::Inert);
 
             assert_eq!(
@@ -420,7 +491,7 @@ mod tests {
                 ReserveResult::Reserved
             );
             assert_eq!(record.status, Status::Reserved);
-            record.release();
+            let _ = record.release();
             assert_eq!(record.status, Status::Inert);
         });
     }
@@ -448,7 +519,7 @@ mod tests {
             assert!(record.needs_teardown());
             assert!(record.is_reserved_or_connected());
 
-            record.release();
+            let _ = record.release();
             assert!(!record.needs_teardown());
             assert!(!record.is_reserved_or_connected());
         });
@@ -472,7 +543,7 @@ mod tests {
             assert!(!record.connect());
             assert_eq!(record.status, Status::Reserved);
 
-            record.release();
+            let _ = record.release();
             assert!(!record.needs_teardown());
         });
     }
@@ -502,7 +573,7 @@ mod tests {
     #[should_panic]
     fn test_release_when_inert_panics() {
         let mut record = Record::known(test_address());
-        record.release();
+        let _ = record.release();
     }
 
     #[test]
@@ -527,7 +598,7 @@ mod tests {
             record.connect();
             assert!(!record.deletable());
 
-            record.release();
+            let _ = record.release();
             assert!(!record.deletable());
 
             record.decrement_primary();
@@ -623,7 +694,7 @@ mod tests {
                 record.reserve(&mut context, interval),
                 ReserveResult::Reserved
             );
-            record.release();
+            let _ = record.release();
 
             // Immediately after release, dialable returns After with jittered time.
             let status = record.dialable(now, true, true);
@@ -647,7 +718,7 @@ mod tests {
                 record.reserve(&mut context, interval),
                 ReserveResult::Reserved
             );
-            record.release();
+            let _ = record.release();
 
             // Immediate re-reserve is rate-limited.
             assert_eq!(
