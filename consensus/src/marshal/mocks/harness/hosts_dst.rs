@@ -527,13 +527,11 @@ fn finalization_lost_behind_block<H: TestHarness>() {
 }
 
 #[test]
-#[ignore = "finding: a re-reported finalization at or below the processed height is never stored"]
 fn test_finalization_lost_behind_block_inline() {
     finalization_lost_behind_block::<InlineHarness>();
 }
 
 #[test]
-#[ignore = "finding: a re-reported finalization at or below the processed height is never stored"]
 fn test_finalization_lost_behind_block_standard() {
     finalization_lost_behind_block::<StandardHarness>();
 }

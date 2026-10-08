@@ -2342,7 +2342,6 @@ mod tests {
     /// the blob untrimmed (the capped prefix is recoverable), after which reads of page 1
     /// rejected it as a partial interior page with `InvalidChecksum`.
     #[test]
-    #[ignore = "finding: bounded recovery keeps a partial interior page above its cap"]
     fn test_bounded_recovery_trims_hole_above_cap() {
         for bounded in [false, true] {
             deterministic::Runner::default().start(|context| async move {

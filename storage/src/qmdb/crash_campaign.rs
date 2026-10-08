@@ -452,7 +452,6 @@ mod tests {
     /// rewrite tore while later pages persisted; bounded merkle recovery used to fail with
     /// `InvalidChecksum` (see `test_bounded_recovery_trims_hole_above_cap`).
     #[test]
-    #[ignore = "finding: bounded recovery keeps a partial interior page above its cap"]
     fn test_any_fixed_crash_seed_92_subset() {
         any_fixed(92, Faults::subset(30));
     }

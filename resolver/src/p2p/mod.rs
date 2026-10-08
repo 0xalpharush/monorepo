@@ -4488,7 +4488,6 @@ mod tests {
     /// blocked every peer this way, a restarted node can no longer fetch anything (as observed
     /// in a marshal crash/restart campaign, coding seed 12).
     #[test_traced]
-    #[ignore = "finding: request ids restart at zero, so stale responses answer new requests"]
     fn test_stale_response_after_restart_does_not_block_peer() {
         let executor = deterministic::Runner::timed(Duration::from_secs(10));
         executor.start(|context| async move {

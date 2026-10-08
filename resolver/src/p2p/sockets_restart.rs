@@ -229,7 +229,6 @@ fn restart_during_serve(
 /// on its new connection, answers the new request (same id) with key 1's data, and peer 0
 /// blocks the honest peer 1.
 #[test_traced("WARN")]
-#[ignore = "finding: request ids restart at zero, so stale responses answer new requests"]
 fn test_stale_response_after_restart_over_lookup() {
     let outcome = restart_during_serve(
         0,
@@ -252,7 +251,6 @@ fn test_stale_response_after_restart_over_lookup() {
 /// (60s connection cooldown, 1s dial frequency) over 150ms links: peer 1 takes 3s to serve, and
 /// peer 0 crashes 100ms into the serve and restarts 500ms later.
 #[test_traced("WARN")]
-#[ignore = "finding: request ids restart at zero, so stale responses answer new requests"]
 fn test_stale_response_after_restart_over_lookup_recommended() {
     let outcome = restart_during_serve(
         0,

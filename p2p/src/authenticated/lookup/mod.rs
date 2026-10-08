@@ -3020,7 +3020,6 @@ mod dst {
     /// jitter on the next dial is drawn from the reservation time, so it is spent while a
     /// handshake longer than twice the connection cooldown is in flight).
     #[test]
-    #[ignore = "bug: simultaneous dials livelock when a handshake outlasts the cooldown jitter"]
     fn test_dst_simultaneous_dials() {
         for seed in 0..5 {
             dst::connect_simultaneously::<Lookup>(

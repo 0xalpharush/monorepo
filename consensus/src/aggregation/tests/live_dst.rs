@@ -357,7 +357,6 @@ fn test_live_campaign_sweep() {
 /// enough peers move past it. (In these campaigns its peers always do, so the stall is
 /// transient; a crash campaign is needed to stall a quorum this way.)
 #[test_traced("WARN")]
-#[ignore = "finding: fast-forwarding the tip onto a certified height stalls it"]
 fn test_live_campaign_tip_never_lands_on_certified_height() {
     let outcome = live_campaign(0, 4, 20, 10, Duration::from_millis(200));
     assert!(outcome.live, "cluster stalled: {outcome:?}");

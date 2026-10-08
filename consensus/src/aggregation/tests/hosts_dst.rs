@@ -262,7 +262,6 @@ fn test_host_campaign_sweep() {
 /// Builds that journal state directly (certificates for heights `0..window`, no `Tip` record)
 /// for every validator, then starts the engines and expects progress.
 #[test_traced("WARN")]
-#[ignore = "finding: replay does not advance the tip over journaled certificates"]
 fn test_replay_advances_tip_over_journaled_certificates() {
     use crate::aggregation::types::{Ack, Activity, Certificate, Item};
     use commonware_storage::journal::segmented::variable::{Config as JConfig, Journal};
@@ -359,7 +358,6 @@ fn test_replay_advances_tip_over_journaled_certificates() {
 /// tip of its peers onto a height it had already certified, nothing advances it further, and once
 /// a quorum is stuck that way the cluster stops certifying.
 #[test_traced("WARN")]
-#[ignore = "finding: fast-forwarding the tip onto a certified height stalls it"]
 fn test_host_campaign_seed_18_fast_forward_onto_certified_height() {
     host_campaign(
         18,
