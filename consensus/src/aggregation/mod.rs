@@ -1262,4 +1262,5 @@ mod tests {
     }
 
     mod hosts_dst;
+    mod live_dst;
 }
